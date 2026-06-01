@@ -12,11 +12,12 @@ export UserProjectAccess
 export newUserProjectAccess
 export SentryEvent
 export newSentryEvent
+export ProjectMetric
+export newProjectMetric
 
 var consoleLog = newConsoleLogger()
 addHandler(consoleLog)
 
-var databaseConnection*: DbConn
 var dbPool*: Pool[DbConn]
 
 proc createConnFactory*(dbPath: string): proc(): DbConn =
@@ -38,6 +39,19 @@ proc initDatabase*(dbPath: string, poolSize: int) =
 
   withDb dbPool:
     db.createTables(User())
-    db.createTables(Project(owner: User()))
-    db.createTables(UserProjectAccess(user: User(), project: Project(owner: User())))
-    db.createTables(SentryEvent(project: Project(owner: User())))
+    db.createTables(Project(publicKey: "", ntfyTopic: "", owner: User()))
+    try:
+      db.exec(sql"ALTER TABLE Project ADD COLUMN publicKey TEXT NOT NULL DEFAULT ''")
+    except DbError:
+      discard
+    try:
+      db.exec(sql"ALTER TABLE Project ADD COLUMN ntfyTopic TEXT NOT NULL DEFAULT ''")
+    except DbError:
+      discard
+    db.createTables(UserProjectAccess(user: User(), project: Project(publicKey: "", ntfyTopic: "", owner: User())))
+    db.createTables(SentryEvent(project: Project(publicKey: "", ntfyTopic: "", owner: User()), stacktrace: ""))
+    try:
+      db.exec(sql"ALTER TABLE SentryEvent ADD COLUMN stacktrace TEXT NOT NULL DEFAULT ''")
+    except DbError:
+      discard
+    db.createTables(ProjectMetric(project: Project(publicKey: "", ntfyTopic: "", owner: User()), tagsJson: ""))

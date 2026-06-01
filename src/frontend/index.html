@@ -3,7 +3,202 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <script>
+            window.tailwind = {
+                config: {
+                    darkMode: "class",
+                },
+            };
+
+            (function () {
+                try {
+                    var savedTheme = localStorage.getItem("obisan_theme");
+                    var prefersDark =
+                        window.matchMedia &&
+                        window.matchMedia("(prefers-color-scheme: dark)").matches;
+
+                    if (savedTheme === "dark" || (!savedTheme && prefersDark)) {
+                        document.documentElement.classList.add("dark");
+                    }
+                } catch (error) {}
+            })();
+        </script>
         <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            :root {
+                color-scheme: light;
+                --hanami-bg: #f9f5f8;
+                --hanami-panel: #ffffff;
+                --hanami-panel-muted: #fcf8fb;
+                --hanami-border: #eadbe5;
+                --hanami-border-strong: #dcc8d6;
+                --hanami-ink: #1f2937;
+                --hanami-muted: #667085;
+                --hanami-accent: #db2777;
+                --hanami-accent-soft: #fce7f3;
+            }
+
+            .dark {
+                color-scheme: dark;
+                --hanami-bg: #111018;
+                --hanami-panel: #1a1722;
+                --hanami-panel-muted: #211b2a;
+                --hanami-border: #33283a;
+                --hanami-border-strong: #4a3651;
+                --hanami-ink: #f8f1f6;
+                --hanami-muted: #b9adbf;
+                --hanami-accent: #f472b6;
+                --hanami-accent-soft: #3b1830;
+            }
+
+            body {
+                margin: 0;
+                background: var(--hanami-bg);
+                color: var(--hanami-ink);
+            }
+
+            .hanami-bg {
+                background:
+                    linear-gradient(180deg, rgba(219, 39, 119, 0.08), transparent 260px),
+                    var(--hanami-bg);
+            }
+
+            .bg-slate-100 {
+                background-color: var(--hanami-bg) !important;
+            }
+
+            .bg-slate-50 {
+                background-color: var(--hanami-panel-muted) !important;
+            }
+
+            .border-slate-200 {
+                border-color: var(--hanami-border) !important;
+            }
+
+            .border-slate-300 {
+                border-color: var(--hanami-border-strong) !important;
+            }
+
+            .hover\:bg-slate-50:hover {
+                background-color: var(--hanami-accent-soft) !important;
+            }
+
+            input:focus,
+            textarea:focus {
+                border-color: var(--hanami-accent) !important;
+                outline: 2px solid rgba(219, 39, 119, 0.22);
+                outline-offset: 1px;
+            }
+
+            .dark .bg-white {
+                background-color: var(--hanami-panel) !important;
+            }
+
+            .dark .bg-slate-50 {
+                background-color: var(--hanami-panel-muted) !important;
+            }
+
+            .dark .bg-slate-100 {
+                background-color: var(--hanami-bg) !important;
+            }
+
+            .dark .bg-slate-900 {
+                background-color: #14121c !important;
+            }
+
+            .dark .bg-slate-950 {
+                background-color: #0f0d15 !important;
+            }
+
+            .dark .text-slate-950,
+            .dark .text-slate-900,
+            .dark .text-slate-800,
+            .dark .text-slate-700 {
+                color: var(--hanami-ink) !important;
+            }
+
+            .dark .text-slate-600,
+            .dark .text-slate-500,
+            .dark .text-slate-400,
+            .dark .text-slate-300 {
+                color: var(--hanami-muted) !important;
+            }
+
+            .dark .text-pink-700,
+            .dark .hover\:text-pink-700:hover {
+                color: var(--hanami-accent) !important;
+            }
+
+            .dark .border-pink-600 {
+                border-color: var(--hanami-accent) !important;
+            }
+
+            .dark .bg-pink-600 {
+                background-color: #db2777 !important;
+            }
+
+            .dark .hover\:bg-pink-500:hover {
+                background-color: #ec4899 !important;
+            }
+
+            .dark input,
+            .dark textarea {
+                background-color: #14121c !important;
+                border-color: var(--hanami-border-strong) !important;
+                color: var(--hanami-ink) !important;
+            }
+
+            .dark input::placeholder,
+            .dark textarea::placeholder {
+                color: #81748a;
+            }
+
+            .dark table tbody tr:hover {
+                background-color: var(--hanami-panel-muted) !important;
+            }
+
+            .dark .bg-red-50,
+            .dark .bg-red-100 {
+                background-color: #42151f !important;
+            }
+
+            .dark .text-red-700,
+            .dark .text-red-800 {
+                color: #fca5a5 !important;
+            }
+
+            .dark .border-red-300 {
+                border-color: #7f1d1d !important;
+            }
+
+            .dark .bg-amber-100 {
+                background-color: #3d2b12 !important;
+            }
+
+            .dark .text-amber-800 {
+                color: #fcd34d !important;
+            }
+
+            .dark .bg-blue-100 {
+                background-color: #172554 !important;
+            }
+
+            .dark .text-blue-800 {
+                color: #93c5fd !important;
+            }
+
+            .dark .bg-violet-100 {
+                background-color: #2e1b4f !important;
+            }
+
+            .dark .text-violet-800 {
+                color: #c4b5fd !important;
+            }
+
+            .dark .text-emerald-700 {
+                color: #6ee7b7 !important;
+            }
+        </style>
     </head>
     <body>
         <div id="ROOT"></div>

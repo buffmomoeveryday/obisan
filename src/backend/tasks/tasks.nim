@@ -1,24 +1,46 @@
 import quee
-import chronicles
 import times
-import ../database/db
+import chronicles
+import json
 
+import ../service/metricsService
+import ../service/uptimeService
+import ../service/uptimeStore
+import ../utils/ntfy
 
-task processSentryEvent(eventId: string, projectId: string, errorType: string, message: string):
+task sendNtfyNotification(topic: string, message: string, title: string):
   queue "notifications"
-  info "Processing Sentry event", eventId = eventId, projectId = projectId, errorType = errorType
+  postToNtfy(topic, message, title, "high")
 
-task sendNtfyNotification(projectId: string, message: string, title: string = "Obisan Alert"):
-  queue "notifications"
-  info "Sending ntfy notification", projectId = projectId, message = message
+task writeProjectMetrics(projectDbId: int, payload: string):
+  queue "metrics"
+  discard saveMetricsPayload(projectDbId, payload)
 
-task cleanupOldEvents(daysToKeep: int = 30):
-  info "Cleaning up old events older than", days = daysToKeep
+task checkUptimeMonitor(monitorId: string):
+  queue "uptime"
+  executeMonitorCheck(monitorId)
 
-task backupProject(projectId: string):
-  queue "urgent"
-  info "Creating backup for project", projectId = projectId
+proc enqueueNtfy*(topic, message, title: string) =
+  discard sendNtfyNotification.enqueue(topic, message, title).run()
 
-task sendWelcomeEmail(email: string, projectName: string):
-  queue "notifications"
-  info "Sending welcome email", email = email, project = projectName
+proc enqueueProjectMetrics*(projectDbId: int, payload: string) =
+  discard writeProjectMetrics.enqueue(projectDbId, payload).run()
+
+proc enqueueUptimeMonitor*(monitorId: string, intervalSecs: int) =
+  discard checkUptimeMonitor.enqueue(monitorId).every(intervalSecs.seconds).run()
+
+proc resyncUptimeMonitor*(monitorId: string, intervalSecs: int) =
+  cancelUptimeJobs(monitorId)
+  enqueueUptimeMonitor(monitorId, intervalSecs)
+
+proc syncUptimeJobsOnStartup*() =
+  for doc in listAllEnabledMonitors():
+    let monitorId = doc["id"].getStr()
+    if not hasUptimeJob(monitorId):
+      let intervalSecs = doc["intervalSecs"].getInt()
+      info "Re-enqueueing uptime monitor", monitorId = monitorId
+      enqueueUptimeMonitor(monitorId, intervalSecs)
+
+proc startUptimeScheduler*() =
+  rebuildStoreIndexes()
+  syncUptimeJobsOnStartup()
