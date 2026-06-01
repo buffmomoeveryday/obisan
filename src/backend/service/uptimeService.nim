@@ -5,8 +5,12 @@ import times
 import os
 import httpclient
 import uuid4
+import norm/[pool, sqlite]
+import lowdb/sqlite
 
+import ../database/db
 import ../utils/ntfy
+import ../utils/webhook
 import ./dbService
 import ./uptimeStore
 
@@ -202,6 +206,29 @@ proc executeMonitorCheck*(monitorId: string) =
     elif result.status == "up":
       let body = name & " is back UP (" & $result.responseMs & "ms)\n" & url
       postToNtfy(ntfyTopic, body, "Uptime recovered: " & name)
+
+    var projectName = ""
+    var projectWebhookUrl = ""
+    let projectId = doc["projectId"].getStr()
+    withDb dbPool:
+      let projectRow = db.getRow(sql"SELECT name, webhookUrl FROM Project WHERE id = ?", projectId)
+      if projectRow.isSome:
+        projectName = dbText(projectRow.get[0])
+        projectWebhookUrl = dbText(projectRow.get[1])
+    if projectWebhookUrl.len > 0:
+      let data = %* {
+        "monitorId": monitorId,
+        "name": name,
+        "url": url,
+        "previousStatus": previousStatus,
+        "status": result.status,
+        "responseMs": result.responseMs,
+        "statusCode": result.statusCode,
+        "error": result.error,
+        "checkedAt": checkedAt
+      }
+      let payload = webhookPayload("uptime.status_changed", projectId, projectName, data)
+      postToWebhook(projectWebhookUrl, "uptime.status_changed", payload)
 
 proc listMonitors*(projectId: string): seq[JsonNode] =
   for doc in listMonitorsForProject(projectId):

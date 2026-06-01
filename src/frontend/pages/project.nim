@@ -10,6 +10,9 @@ import ../components/layout
 var editingProjectName = false
 var projectNameDraft = ""
 var savingProjectName = false
+var webhookUrlDraft = ""
+var webhookDraftProjectId = ""
+var savingWebhookUrl = false
 
 proc ensureProjectPage(projectId: string, qryParams: Table[string, string]) =
   if logsPollingProjectId.len > 0:
@@ -91,8 +94,12 @@ proc render*(context: Context): VNode =
   let dsn = currentProject.dsn
   let ntfyUrl = currentProject.ntfyUrl
   let ntfyTopic = currentProject.ntfyTopic
+  let webhookUrl = currentProject.webhookUrl
   let projectName = displayProjectName(projectId, currentProject.name)
   let renameDraftSeed = projectNameForEdit(currentProject.name)
+  if webhookDraftProjectId != projectId:
+    webhookDraftProjectId = projectId
+    webhookUrlDraft = webhookUrl
 
   buildHtml(tdiv(class="min-h-screen hanami-bg text-slate-950")):
     renderAppHeader("Issues", projectName)
@@ -149,6 +156,44 @@ proc render*(context: Context): VNode =
               span(class="font-mono text-xs"):
                 text ntfyTopic
               text " on ntfy.sh (topic updates when you rename the project)."
+          tdiv(class="mt-4 max-w-2xl rounded border border-slate-200 bg-white p-4"):
+            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+              text "Webhook URL"
+            p(class="mb-3 text-sm text-slate-600"):
+              text "Sends JSON for new issues, logs, metrics, and uptime status changes."
+            tdiv(class="flex flex-wrap gap-2"):
+              input(
+                class="min-w-0 flex-1 rounded border border-slate-300 px-3 py-2 text-sm",
+                placeholder="https://example.com/obisan-webhook",
+                `type`="url",
+                value=webhookUrlDraft
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  webhookUrlDraft = $n.value
+              button(class="rounded bg-pink-600 px-3 py-2 text-sm font-medium text-white hover:bg-pink-500"):
+                if savingWebhookUrl:
+                  text "Saving..."
+                else:
+                  text "Save webhook"
+                proc onclick(ev: Event; n: VNode) =
+                  if not savingWebhookUrl:
+                    savingWebhookUrl = true
+                    updateProjectWebhookUrl(projectId, webhookUrlDraft, proc() =
+                      savingWebhookUrl = false
+                    )
+              if webhookUrl.len > 0:
+                button(class="rounded border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"):
+                  text "Clear"
+                  proc onclick(ev: Event; n: VNode) =
+                    if not savingWebhookUrl:
+                      savingWebhookUrl = true
+                      updateProjectWebhookUrl(projectId, "", proc() =
+                        webhookUrlDraft = ""
+                        savingWebhookUrl = false
+                      )
+            if webhookUrl.len > 0:
+              p(class="mt-2 break-all font-mono text-xs text-slate-500"):
+                text webhookUrl
         tdiv(class="flex flex-wrap gap-2"):
           button(class="rounded border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"):
             text "Copy DSN"

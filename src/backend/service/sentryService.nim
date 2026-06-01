@@ -10,6 +10,7 @@ import ../database/db
 import norm/[pool, sqlite]
 import lowdb/sqlite
 import ../tasks/tasks
+import ../utils/webhook
 import ../../shared/types/sentry
 import ./requestService
 
@@ -193,6 +194,20 @@ proc logDetails(logNode: JsonNode): string =
   else:
     details.pretty()
 
+proc sentryWebhookData(
+  eventId, level, platform, errorType, message, stacktrace: string,
+  receivedAt: int64
+): JsonNode =
+  %* {
+    "eventId": eventId,
+    "level": level,
+    "platform": platform,
+    "errorType": errorType,
+    "message": message,
+    "stacktrace": stacktrace,
+    "receivedAt": receivedAt
+  }
+
 proc saveSentryLog*(
   project: Project,
   projectIdStr: string,
@@ -223,6 +238,14 @@ proc saveSentryLog*(
     eventId = eventId,
     level = level,
     message = message
+
+  if project.webhookUrl.len > 0:
+    let data = sentryWebhookData(eventId, level, "log", "Log", message, dbRecord.stacktrace, unixTime)
+    enqueueWebhook(
+      project.webhookUrl,
+      "log.created",
+      webhookPayload("log.created", $project.id, project.name, data)
+    )
 
 proc saveSentryLogs*(
   project: Project,
@@ -287,6 +310,14 @@ proc saveSentryBreadcrumbLog*(
     category = breadcrumb.category,
     message = message
 
+  if project.webhookUrl.len > 0:
+    let data = sentryWebhookData(eventId, level, "log", "Log", message, "", unixTime)
+    enqueueWebhook(
+      project.webhookUrl,
+      "log.created",
+      webhookPayload("log.created", $project.id, project.name, data)
+    )
+
 proc saveSentryBreadcrumbLogs*(
   project: Project,
   projectIdStr: string,
@@ -343,6 +374,14 @@ proc saveSentryBreadcrumbJsonLog*(
     eventId = eventId,
     level = level,
     message = message
+
+  if project.webhookUrl.len > 0:
+    let data = sentryWebhookData(eventId, level, "log", "Log", message, dbRecord.stacktrace, unixTime)
+    enqueueWebhook(
+      project.webhookUrl,
+      "log.created",
+      webhookPayload("log.created", $project.id, project.name, data)
+    )
 
 proc saveSentryBreadcrumbJsonLogs*(
   project: Project,
@@ -480,6 +519,14 @@ proc saveSentryEventJson*(
     let notificationBody = "[" & level & "] " & displayMessage
     enqueueNtfy(project.ntfyTopic, notificationBody, alertTitle)
 
+  if project.webhookUrl.len > 0:
+    let data = sentryWebhookData(eventId, level, platform, errorType, message, stacktrace, unixNow)
+    enqueueWebhook(
+      project.webhookUrl,
+      "issue.created",
+      webhookPayload("issue.created", $project.id, project.name, data)
+    )
+
 proc saveSentryEvent*(
   project: Project,
   projectIdStr: string,
@@ -513,6 +560,14 @@ proc saveSentryEvent*(
     let alertTitle = project.name & ": " & errorType
     let notificationBody = "[" & eventData.level & "] " & displayMessage
     enqueueNtfy(project.ntfyTopic, notificationBody, alertTitle)
+
+  if project.webhookUrl.len > 0:
+    let data = sentryWebhookData(eventId, eventData.level, eventData.platform, errorType, message, stacktrace, unixNow)
+    enqueueWebhook(
+      project.webhookUrl,
+      "issue.created",
+      webhookPayload("issue.created", $project.id, project.name, data)
+    )
 
 proc processEnvelopeBody*(project: Project, projectIdStr: string, body: string): string =
   var pos = 0

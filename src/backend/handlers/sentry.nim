@@ -8,6 +8,7 @@ import ../database/db
 import ../tasks/tasks
 import ../utils/http
 import ../utils/ntfy
+import ../utils/webhook
 import ../service/[authService, dbService, eventService, metricsService, projectService, queryService, requestService, sentryService]
 
 proc listProjectEvents*(request: Request) =
@@ -387,7 +388,7 @@ proc listProjects*(request: Request) =
     var parts: seq[string] = @[]
     withDb dbPool:
       for row in db.rows(
-        sql"""SELECT p.id, p.name, p.publicKey, p.ntfyTopic, COUNT(e.id) AS issueCount
+        sql"""SELECT p.id, p.name, p.publicKey, p.ntfyTopic, p.webhookUrl, COUNT(e.id) AS issueCount
               FROM Project p
               LEFT JOIN SentryEvent e ON e.project = p.id AND e.platform != 'log'
               WHERE p.owner = ?
@@ -399,7 +400,7 @@ proc listProjects*(request: Request) =
         let name = dbText(row[1])
         let publicKey = ensurePublicKey(db, name, dbText(row[2]))
         let ntfyTopic = ensureNtfyTopic(db, dbId.int, name, dbText(row[3]))
-        parts.add projectListItemJson(request, dbId, name, publicKey, ntfyTopic, row[4].i).pretty
+        parts.add projectListItemJson(request, dbId, name, publicKey, ntfyTopic, dbText(row[4]), row[5].i).pretty
 
     request.respond(200, newJsonHeaders(), "{\"projects\":[" & parts.join(",") & "]}")
   except CatchableError as e:
@@ -450,13 +451,24 @@ proc updateProject*(request: Request) =
     request.respond(400, newJsonHeaders(), (%* {"error": "Request body required"}).pretty)
     return
 
-  var projectName: string
+  var projectName = ""
+  var webhookUrl = ""
+  var hasName = false
+  var hasWebhookUrl = false
   try:
     let body = parseJson(request.body)
-    if "name" notin body:
-      request.respond(400, newJsonHeaders(), (%* {"error": "Project name required"}).pretty)
+    if "name" in body:
+      hasName = true
+      projectName = normalizeProjectName(body["name"].getStr())
+    if "webhookUrl" in body:
+      hasWebhookUrl = true
+      webhookUrl = normalizeWebhookUrl(body["webhookUrl"].getStr())
+    if not hasName and not hasWebhookUrl:
+      request.respond(400, newJsonHeaders(), (%* {"error": "No project fields provided"}).pretty)
       return
-    projectName = normalizeProjectName(body["name"].getStr())
+  except ValueError as e:
+    request.respond(400, newJsonHeaders(), (%* {"error": e.msg}).pretty)
+    return
   except CatchableError:
     request.respond(400, newJsonHeaders(), (%* {"error": "Invalid request body"}).pretty)
     return
@@ -470,18 +482,22 @@ proc updateProject*(request: Request) =
         return
 
       let dbId = projectInfo.get.dbId
-      db.exec(sql"UPDATE Project SET name = ? WHERE id = ?", projectName, dbId)
-      let ntfyTopic = generateNtfyTopic(dbId, projectName)
-      db.exec(sql"UPDATE Project SET ntfyTopic = ? WHERE id = ?", ntfyTopic, dbId)
+      if hasName:
+        db.exec(sql"UPDATE Project SET name = ? WHERE id = ?", projectName, dbId)
+        let ntfyTopic = generateNtfyTopic(dbId, projectName)
+        db.exec(sql"UPDATE Project SET ntfyTopic = ? WHERE id = ?", ntfyTopic, dbId)
+      if hasWebhookUrl:
+        db.exec(sql"UPDATE Project SET webhookUrl = ? WHERE id = ?", webhookUrl, dbId)
 
       let row = db.getRow(
-        sql"SELECT id, name, publicKey, ntfyTopic FROM Project WHERE id = ?",
+        sql"SELECT id, name, publicKey, ntfyTopic, webhookUrl FROM Project WHERE id = ?",
         dbId
       )
       projectRecord = Project(
         name: dbText(row.get[1]),
         publicKey: dbText(row.get[2]),
         ntfyTopic: dbText(row.get[3]),
+        webhookUrl: dbText(row.get[4]),
         owner: user.get
       )
       projectRecord.id = row.get[0].i

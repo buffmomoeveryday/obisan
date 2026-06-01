@@ -10,6 +10,7 @@ type
     name*: string
     publicKey*: string
     ntfyTopic*: string
+    webhookUrl*: string
     owner*: User
 
   UserProjectAccess* = ref object of Model
@@ -38,8 +39,8 @@ type
 proc newUser*(name, email, passwordHash: string): User =
   User(name: name, email: email, passwordHash: passwordHash)
 
-proc newProject*(name, publicKey, ntfyTopic: string, owner: User): Project =
-  Project(name: name, publicKey: publicKey, ntfyTopic: ntfyTopic, owner: owner)
+proc newProject*(name, publicKey, ntfyTopic: string, owner: User, webhookUrl: string = ""): Project =
+  Project(name: name, publicKey: publicKey, ntfyTopic: ntfyTopic, webhookUrl: webhookUrl, owner: owner)
 
 proc newUserProjectAccess*(user: User, project: Project): UserProjectAccess =
   UserProjectAccess(user: user, project: project)

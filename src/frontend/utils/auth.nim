@@ -19,6 +19,7 @@ type Project* = object
   dsn*: string
   ntfyTopic*: string
   ntfyUrl*: string
+  webhookUrl*: string
   issueCount*: int
 
 type Issue* = object
@@ -263,6 +264,7 @@ proc parseProject(data: JsonNode): Project =
     dsn: data["dsn"].getStr(),
     ntfyTopic: if "ntfyTopic" in data: data["ntfyTopic"].getStr() else: "",
     ntfyUrl: if "ntfyUrl" in data: data["ntfyUrl"].getStr() else: "",
+    webhookUrl: if "webhookUrl" in data: data["webhookUrl"].getStr() else: "",
     issueCount: if "issueCount" in data: data["issueCount"].getInt() else: 0
   )
 
@@ -1169,7 +1171,6 @@ proc updateProjectName*(projectId, name: string, onDone: proc() {.closure.}) =
           projects[i] = parseProject(data)
           break
       authMessage = ""
-      onDone()
     elif status == 401:
       clearSession()
       authMessage = "Sign in to update this project."
@@ -1178,5 +1179,38 @@ proc updateProjectName*(projectId, name: string, onDone: proc() {.closure.}) =
       authMessage = "Project not found."
     else:
       authMessage = "Unable to update project."
+    redraw()
+  )
+
+proc updateProjectWebhookUrl*(projectId, webhookUrl: string, onDone: proc() {.closure.}) =
+  let trimmed = webhookUrl.strip()
+  authMessage = ""
+  let body = $(%* {"webhookUrl": trimmed})
+  let path = cstring("/api/projects/" & projectId & "/")
+  ajax(cstring"PATCH", path, authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    if status == 200:
+      let data = parseJson($response)
+      for i, project in projects:
+        if project.id == projectId:
+          projects[i] = parseProject(data)
+          break
+      authMessage = ""
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update this project."
+      navigate("/login")
+    elif status == 404:
+      authMessage = "Project not found."
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to update webhook."
+      except CatchableError:
+        authMessage = "Unable to update webhook."
+    onDone()
     redraw()
   )

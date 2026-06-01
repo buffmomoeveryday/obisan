@@ -6,6 +6,7 @@ import norm/[pool, sqlite]
 import lowdb/sqlite
 
 import ../database/db
+import ../utils/webhook
 import ./dbService
 import ./queryService
 
@@ -175,10 +176,16 @@ proc parseMetricsPayload*(body: string): seq[MetricInput] =
 
 proc saveMetricsPayload*(projectDbId: int, body: string): int =
   let metrics = parseMetricsPayload(body)
-  var project = Project(publicKey: "", ntfyTopic: "", owner: User())
+  var project = Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User())
   project.id = projectDbId
+  var projectName = ""
+  var projectWebhookUrl = ""
 
   withDb dbPool:
+    let projectRow = db.getRow(sql"SELECT name, webhookUrl FROM Project WHERE id = ?", projectDbId)
+    if projectRow.isSome:
+      projectName = dbText(projectRow.get[0])
+      projectWebhookUrl = dbText(projectRow.get[1])
     for metric in metrics:
       var record = newProjectMetric(
         project,
@@ -191,6 +198,25 @@ proc saveMetricsPayload*(projectDbId: int, body: string): int =
       )
       db.insert(record)
       inc result
+
+  if projectWebhookUrl.len > 0 and metrics.len > 0:
+    var metricItems = newJArray()
+    for metric in metrics:
+      add(metricItems, %* {
+        "name": metric.name,
+        "type": metric.metricType,
+        "value": metric.value,
+        "unit": metric.unit,
+        "tags": parseJson(metric.tagsJson),
+        "receivedAt": metric.receivedAt
+      })
+    let payload = webhookPayload(
+      "metrics.ingested",
+      $projectDbId,
+      projectName,
+      %* {"metrics": metricItems, "count": metrics.len}
+    )
+    postToWebhook(projectWebhookUrl, "metrics.ingested", payload)
 
 proc countProjectMetrics*(db: DbConn, projectDbId: int, search: string): int =
   let row =

@@ -64,9 +64,9 @@ proc selectProjectByPathId*(db: DbConn, projectIdStr: string): Option[Project] =
     block:
       let numericId = parseProjectDbId(projectIdStr)
       if numericId.isSome:
-        db.getRow(sql"SELECT id, name, publicKey, ntfyTopic FROM Project WHERE id = ?", numericId.get)
+        db.getRow(sql"SELECT id, name, publicKey, ntfyTopic, webhookUrl FROM Project WHERE id = ?", numericId.get)
       else:
-        db.getRow(sql"SELECT id, name, publicKey, ntfyTopic FROM Project WHERE name = ?", projectIdStr)
+        db.getRow(sql"SELECT id, name, publicKey, ntfyTopic, webhookUrl FROM Project WHERE name = ?", projectIdStr)
 
   if row.isNone:
     return none[Project]()
@@ -75,6 +75,7 @@ proc selectProjectByPathId*(db: DbConn, projectIdStr: string): Option[Project] =
     name: dbText(row.get[1]),
     publicKey: dbText(row.get[2]),
     ntfyTopic: dbText(row.get[3]),
+    webhookUrl: dbText(row.get[4]),
     owner: User()
   )
   projectRecord.id = row.get[0].i
@@ -96,13 +97,14 @@ proc projectToJson*(request: Request, project: Project): JsonNode =
     "publicKey": project.publicKey,
     "ntfyTopic": project.ntfyTopic,
     "ntfyUrl": ntfySubscribeUrl(project.ntfyTopic),
+    "webhookUrl": project.webhookUrl,
     "dsn": buildProjectDsn(request, project.publicKey, $project.id)
   }
 
 proc projectListItemJson*(
   request: Request,
   dbId: int64,
-  name, publicKey, ntfyTopic: string,
+  name, publicKey, ntfyTopic, webhookUrl: string,
   issueCount: int64
 ): JsonNode =
   %* {
@@ -111,6 +113,7 @@ proc projectListItemJson*(
     "publicKey": publicKey,
     "ntfyTopic": ntfyTopic,
     "ntfyUrl": ntfySubscribeUrl(ntfyTopic),
+    "webhookUrl": webhookUrl,
     "issueCount": issueCount,
     "dsn": buildProjectDsn(request, publicKey, $dbId)
   }

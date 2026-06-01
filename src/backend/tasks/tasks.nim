@@ -7,10 +7,15 @@ import ../service/metricsService
 import ../service/uptimeService
 import ../service/uptimeStore
 import ../utils/ntfy
+import ../utils/webhook
 
 task sendNtfyNotification(topic: string, message: string, title: string):
   queue "notifications"
   postToNtfy(topic, message, title, "high")
+
+task sendWebhookNotification(url: string, eventType: string, payload: string):
+  queue "notifications"
+  postToWebhook(url, eventType, parseJson(payload))
 
 task writeProjectMetrics(projectDbId: int, payload: string):
   queue "metrics"
@@ -22,6 +27,11 @@ task checkUptimeMonitor(monitorId: string):
 
 proc enqueueNtfy*(topic, message, title: string) =
   discard sendNtfyNotification.enqueue(topic, message, title).run()
+
+proc enqueueWebhook*(url, eventType: string, payload: JsonNode) =
+  if url.len == 0:
+    return
+  discard sendWebhookNotification.enqueue(url, eventType, payload.pretty).run()
 
 proc enqueueProjectMetrics*(projectDbId: int, payload: string) =
   discard writeProjectMetrics.enqueue(projectDbId, payload).run()

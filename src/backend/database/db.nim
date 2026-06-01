@@ -39,7 +39,7 @@ proc initDatabase*(dbPath: string, poolSize: int) =
 
   withDb dbPool:
     db.createTables(User())
-    db.createTables(Project(publicKey: "", ntfyTopic: "", owner: User()))
+    db.createTables(Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User()))
     try:
       db.exec(sql"ALTER TABLE Project ADD COLUMN publicKey TEXT NOT NULL DEFAULT ''")
     except DbError:
@@ -48,10 +48,14 @@ proc initDatabase*(dbPath: string, poolSize: int) =
       db.exec(sql"ALTER TABLE Project ADD COLUMN ntfyTopic TEXT NOT NULL DEFAULT ''")
     except DbError:
       discard
-    db.createTables(UserProjectAccess(user: User(), project: Project(publicKey: "", ntfyTopic: "", owner: User())))
-    db.createTables(SentryEvent(project: Project(publicKey: "", ntfyTopic: "", owner: User()), stacktrace: ""))
+    try:
+      db.exec(sql"ALTER TABLE Project ADD COLUMN webhookUrl TEXT NOT NULL DEFAULT ''")
+    except DbError:
+      discard
+    db.createTables(UserProjectAccess(user: User(), project: Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User())))
+    db.createTables(SentryEvent(project: Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User()), stacktrace: ""))
     try:
       db.exec(sql"ALTER TABLE SentryEvent ADD COLUMN stacktrace TEXT NOT NULL DEFAULT ''")
     except DbError:
       discard
-    db.createTables(ProjectMetric(project: Project(publicKey: "", ntfyTopic: "", owner: User()), tagsJson: ""))
+    db.createTables(ProjectMetric(project: Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User()), tagsJson: ""))
