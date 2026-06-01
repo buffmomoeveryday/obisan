@@ -13,6 +13,7 @@ var newMonitorTimeout = "5000"
 var newMonitorRetries = "2"
 var newMonitorInterval = "60"
 var selectedMonitorId = ""
+var showAddMonitorModal = false
 
 proc ensureUptimePage(projectId: string) =
   if logsPollingProjectId.len > 0:
@@ -114,105 +115,18 @@ proc render*(context: Context): VNode =
     tdiv(class="mx-auto max-w-6xl px-6 py-8"):
       renderProjectTabs(projectId, projectName, "uptime")
 
-      tdiv(class="mb-6 rounded border border-slate-200 bg-white p-5"):
-        h3(class="text-sm font-semibold uppercase tracking-wide text-slate-500"):
-          text "Add monitor"
-        p(class="mt-1 text-sm text-slate-600"):
-          text "Probe an HTTP endpoint on a schedule. Alerts go to the project ntfy topic on status changes."
-        tdiv(class="mt-4 grid gap-3 md:grid-cols-2"):
-          tdiv:
-            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
-              text "Name"
-            input(
-              class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
-              placeholder="e.g. API health",
-              `type`="text",
-              value=newMonitorName
-            ):
-              proc oninput(ev: Event; n: VNode) =
-                newMonitorName = $n.value
-          tdiv:
-            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
-              text "URL"
-            input(
-              class="w-full rounded border border-slate-300 px-3 py-2 text-sm font-mono",
-              placeholder="https://example.com/health",
-              `type`="url",
-              value=newMonitorUrl
-            ):
-              proc oninput(ev: Event; n: VNode) =
-                newMonitorUrl = $n.value
-          tdiv:
-            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
-              text "Timeout (ms)"
-            input(
-              class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
-              placeholder="5000",
-              `type`="number",
-              value=newMonitorTimeout
-            ):
-              proc oninput(ev: Event; n: VNode) =
-                newMonitorTimeout = $n.value
-          tdiv:
-            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
-              text "Retries"
-            input(
-              class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
-              placeholder="2",
-              `type`="number",
-              value=newMonitorRetries
-            ):
-              proc oninput(ev: Event; n: VNode) =
-                newMonitorRetries = $n.value
-          tdiv:
-            label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
-              text "Check interval (seconds)"
-            input(
-              class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
-              placeholder="60",
-              `type`="number",
-              value=newMonitorInterval
-            ):
-              proc oninput(ev: Event; n: VNode) =
-                newMonitorInterval = $n.value
-        tdiv(class="mt-4"):
-          button(class="rounded bg-pink-600 px-4 py-2 text-sm font-medium text-white hover:bg-pink-500"):
-            if uptimeSaving:
-              text "Saving..."
-            else:
-              text "Add monitor"
-            proc onclick(ev: Event; n: VNode) =
-              if uptimeSaving:
-                return
-              var timeoutMs = 5000
-              var retryCount = 2
-              var intervalSecs = 60
-              try:
-                timeoutMs = parseInt(newMonitorTimeout.strip())
-              except ValueError:
-                discard
-              try:
-                retryCount = parseInt(newMonitorRetries.strip())
-              except ValueError:
-                discard
-              try:
-                intervalSecs = parseInt(newMonitorInterval.strip())
-              except ValueError:
-                discard
-              createUptimeMonitor(projectId, newMonitorName, newMonitorUrl, timeoutMs, retryCount, intervalSecs, proc() =
-                newMonitorName = ""
-                newMonitorUrl = ""
-                newMonitorTimeout = "5000"
-                newMonitorRetries = "2"
-                newMonitorInterval = "60"
-              )
-
       tdiv(class="mb-3 flex items-center justify-between gap-2"):
         h3(class="text-lg font-semibold"):
           text "Monitors"
-        if uptimePolling:
-          span(class="text-sm text-slate-500"):
-            text "Auto-refreshing every 30s"
+        tdiv(class="flex flex-wrap items-center gap-3"):
+          if uptimePolling:
+            span(class="text-sm text-slate-500"):
+              text "Auto-refreshing every 30s"
+          button(class="rounded bg-pink-600 px-4 py-2 text-sm font-medium text-white hover:bg-pink-500"):
+            text "Add monitor"
+            proc onclick(ev: Event; n: VNode) =
+              showAddMonitorModal = true
+              redraw()
 
       if uptimeLoading and projectUptimeMonitors.len == 0:
         tdiv(class="rounded border border-slate-200 bg-white p-8 text-center text-slate-500"):
@@ -331,5 +245,115 @@ proc render*(context: Context): VNode =
       if authMessage.len > 0:
         p(class="mt-4 text-sm text-red-700"):
           text authMessage
+
+    if showAddMonitorModal:
+      tdiv(class="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/60 px-4 py-6"):
+        tdiv(class="w-full max-w-2xl rounded border border-slate-200 bg-white p-5 shadow-xl"):
+          tdiv(class="mb-4 flex items-start justify-between gap-3"):
+            tdiv:
+              h3(class="text-lg font-semibold"):
+                text "Add monitor"
+              p(class="mt-1 text-sm text-slate-600"):
+                text "Probe an HTTP endpoint on a schedule. Alerts go to the project ntfy topic on status changes."
+            button(class="rounded border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"):
+              text "Close"
+              proc onclick(ev: Event; n: VNode) =
+                if not uptimeSaving:
+                  showAddMonitorModal = false
+                  redraw()
+          tdiv(class="grid gap-3 md:grid-cols-2"):
+            tdiv:
+              label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+                text "Name"
+              input(
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
+                placeholder="e.g. API health",
+                `type`="text",
+                value=newMonitorName
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  newMonitorName = $n.value
+            tdiv:
+              label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+                text "URL"
+              input(
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm font-mono",
+                placeholder="https://example.com/health",
+                `type`="url",
+                value=newMonitorUrl
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  newMonitorUrl = $n.value
+            tdiv:
+              label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+                text "Timeout (ms)"
+              input(
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
+                placeholder="5000",
+                `type`="number",
+                value=newMonitorTimeout
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  newMonitorTimeout = $n.value
+            tdiv:
+              label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+                text "Retries"
+              input(
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
+                placeholder="2",
+                `type`="number",
+                value=newMonitorRetries
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  newMonitorRetries = $n.value
+            tdiv:
+              label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
+                text "Check interval (seconds)"
+              input(
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm",
+                placeholder="60",
+                `type`="number",
+                value=newMonitorInterval
+              ):
+                proc oninput(ev: Event; n: VNode) =
+                  newMonitorInterval = $n.value
+          tdiv(class="mt-5 flex justify-end gap-2"):
+            button(class="rounded border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"):
+              text "Cancel"
+              proc onclick(ev: Event; n: VNode) =
+                if not uptimeSaving:
+                  showAddMonitorModal = false
+                  redraw()
+            button(class="rounded bg-pink-600 px-4 py-2 text-sm font-medium text-white hover:bg-pink-500"):
+              if uptimeSaving:
+                text "Saving..."
+              else:
+                text "Add monitor"
+              proc onclick(ev: Event; n: VNode) =
+                if uptimeSaving:
+                  return
+                var timeoutMs = 5000
+                var retryCount = 2
+                var intervalSecs = 60
+                try:
+                  timeoutMs = parseInt(newMonitorTimeout.strip())
+                except ValueError:
+                  discard
+                try:
+                  retryCount = parseInt(newMonitorRetries.strip())
+                except ValueError:
+                  discard
+                try:
+                  intervalSecs = parseInt(newMonitorInterval.strip())
+                except ValueError:
+                  discard
+                createUptimeMonitor(projectId, newMonitorName, newMonitorUrl, timeoutMs, retryCount, intervalSecs, proc() =
+                  newMonitorName = ""
+                  newMonitorUrl = ""
+                  newMonitorTimeout = "5000"
+                  newMonitorRetries = "2"
+                  newMonitorInterval = "60"
+                  showAddMonitorModal = false
+                )
 
     renderCopyFeedback()

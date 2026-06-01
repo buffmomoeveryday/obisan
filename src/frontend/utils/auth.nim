@@ -97,6 +97,9 @@ var
   logsQueryKey* = ""
   logsPolling* = false
   logsPollingProjectId* = ""
+  breadcrumbLogsLoading* = false
+  breadcrumbLogsLoadedFor* = ""
+  breadcrumbLogsBaseEventId* = ""
   metricsLoading* = false
   metricsProjectId* = ""
   metricsSearch* = ""
@@ -124,6 +127,7 @@ var
   projects* = newSeq[Project]()
   projectEvents* = newSeq[Issue]()
   projectLogs* = newSeq[Issue]()
+  breadcrumbLogs* = newSeq[Issue]()
   projectMetrics* = newSeq[Metric]()
   projectUptimeMonitors* = newSeq[UptimeMonitor]()
   projectUptimeChecks* = newSeq[UptimeCheck]()
@@ -197,6 +201,9 @@ proc clearSession*() =
   logsQueryKey = ""
   logsPolling = false
   logsPollingProjectId = ""
+  breadcrumbLogsLoading = false
+  breadcrumbLogsLoadedFor = ""
+  breadcrumbLogsBaseEventId = ""
   metricsLoading = false
   metricsProjectId = ""
   metricsSearch = ""
@@ -222,6 +229,7 @@ proc clearSession*() =
   projectUptimeChecks = @[]
   issueDetailLoadedFor = ""
   projectLogs = @[]
+  breadcrumbLogs = @[]
   projectMetrics = @[]
   selectedIssue = IssueDetail()
   copyFeedback = ""
@@ -374,6 +382,19 @@ proc parseIssueDetail(data: JsonNode): IssueDetail =
     stacktrace: data["stacktrace"].getStr()
   )
 
+proc breadcrumbParentEventId*(eventId: string): string =
+  let marker = "-breadcrumb-"
+  let markerAt = eventId.find(marker)
+  if markerAt < 0:
+    ""
+  else:
+    eventId[0 ..< markerAt]
+
+proc isBreadcrumbLogEventId*(eventId: string): bool =
+  breadcrumbParentEventId(eventId).len > 0
+
+proc buildLogsPath(projectId: string, search: string, page, pageSize: int): string
+
 proc loadIssueDetail*(projectId, eventId: string) =
   if savedToken().len == 0:
     return
@@ -399,6 +420,44 @@ proc loadIssueDetail*(projectId, eventId: string) =
     else:
       issueDetailLoadedFor = ""
       authMessage = "Unable to load issue details."
+    redraw()
+  )
+
+proc loadBreadcrumbLogs*(projectId, eventId: string) =
+  if savedToken().len == 0:
+    return
+
+  let baseEventId = breadcrumbParentEventId(eventId)
+  if baseEventId.len == 0:
+    breadcrumbLogs = @[]
+    breadcrumbLogsLoadedFor = ""
+    breadcrumbLogsBaseEventId = ""
+    return
+
+  let viewKey = projectId & ":" & eventId
+  breadcrumbLogsLoading = true
+  let path = cstring(buildLogsPath(projectId, baseEventId, 1, 100))
+  ajaxGet(path, authHeaders(), proc(status: int, response: cstring) =
+    breadcrumbLogsLoading = false
+    if status == 200:
+      let data = parseJson($response)
+      breadcrumbLogs = @[]
+      for item in data["logs"]:
+        let itemIssue = parseIssue(item)
+        if itemIssue.eventId.find(baseEventId & "-breadcrumb-") == 0:
+          breadcrumbLogs.add itemIssue
+      breadcrumbLogsLoadedFor = viewKey
+      breadcrumbLogsBaseEventId = baseEventId
+      authMessage = ""
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to view logs."
+      navigate("/login")
+    else:
+      breadcrumbLogs = @[]
+      breadcrumbLogsLoadedFor = ""
+      breadcrumbLogsBaseEventId = baseEventId
+      authMessage = "Unable to load breadcrumb logs."
     redraw()
   )
 
