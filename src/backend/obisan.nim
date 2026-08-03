@@ -3,10 +3,13 @@ import quee
 
 import ./database/db
 import ./handlers/sentry
+import ./handlers/settings
+import ./handlers/projectMembers
 import ./handlers/users
 import ./handlers/uptime
 import ./utils/http
 import ./utils/runtimeDeps
+import ./service/sentryService
 import ./service/uptimeStore
 import ./tasks/tasks
 
@@ -21,13 +24,19 @@ proc serveAppJs(request: Request) =
   const appJs = staticRead("../../bin/app.js")
   request.respond(200, newJsHeaders(), appJs)
 
-proc startServer(port: int = 8080, dbPath: string = "observability.db", taskDbPath: string = "./obisanTasks", poolSize: int = 8) =
+proc startServer(port: int = 8080, dbPath: string = "observability.db", taskDbPath: string = "./obisanTasks", poolSize: int = 32) =
   requireRuntimeDependencies()
   initDatabase(dbPath, poolSize)
 
   info "Task queue database", path = taskDbPath
-  initQuee(taskDbPath, queues = ["default", "urgent", "notifications", "metrics", "uptime"])
+  initQuee(
+    taskDbPath,
+    queues = ["default", "urgent", "uptime"],
+    workerConcurrency = 1
+  )
   initUptimeStore(taskDbPath)
+  startMetricsIngestionWorker()
+  startSentryIngestionWorker()
 
   var router: Router
   router.get("/", serveIndex)
@@ -36,8 +45,15 @@ proc startServer(port: int = 8080, dbPath: string = "observability.db", taskDbPa
   router.post("/api/register/", toGcsafeHandler(registerUser))
   router.post("/api/login/", toGcsafeHandler(loginUser))
   router.get("/api/profile/", toGcsafeHandler(getProfile))
+  router.patch("/api/profile/", toGcsafeHandler(updateProfile))
+  router.get("/api/settings/", toGcsafeHandler(getSettings))
+  router.patch("/api/settings/", toGcsafeHandler(updateSettings))
   router.get("/api/projects/", toGcsafeHandler(listProjects))
   router.get("/api/projects/@id/events/", toGcsafeHandler(listProjectEvents))
+  router.get("/api/projects/@id/members/", toGcsafeHandler(listProjectMembersHandler))
+  router.post("/api/projects/@id/members/", toGcsafeHandler(upsertProjectMemberHandler))
+  router.delete("/api/projects/@id/members/@memberId/", toGcsafeHandler(removeProjectMemberHandler))
+  router.post("/api/invites/", toGcsafeHandler(inviteUserHandler))
   router.get("/api/projects/@id/events/@eventId/", toGcsafeHandler(getProjectEvent))
   router.get("/api/projects/@id/logs/", toGcsafeHandler(listProjectLogs))
   router.get("/api/projects/@id/metrics/", toGcsafeHandler(listProjectMetrics))
@@ -54,7 +70,7 @@ proc startServer(port: int = 8080, dbPath: string = "observability.db", taskDbPa
   router.post("/api/@id/envelope/", toGcsafeHandler(handleSentryEnvelope))
 
   info "Task queue starting..."
-  startQuee()
+  startQuee(concurrency = 4)
   startUptimeScheduler()
 
   let server = newServer(router)

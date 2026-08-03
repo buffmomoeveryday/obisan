@@ -20,6 +20,8 @@ type Project* = object
   ntfyTopic*: string
   ntfyUrl*: string
   webhookUrl*: string
+  emailEnabled*: bool
+  emailToAddrs*: string
   issueCount*: int
 
 type Issue* = object
@@ -37,6 +39,7 @@ type IssueDetail* = object
   level*: string
   platform*: string
   receivedAt*: string
+  receivedAtUnix*: int64
   stacktrace*: string
 
 type Metric* = object
@@ -70,7 +73,30 @@ type UptimeCheck* = object
   error*: string
   checkedAt*: string
 
+type ProjectMember* = object
+  id*: string
+  name*: string
+  email*: string
+  owner*: bool
+
+type AppSettings* = object
+  ntfyServerUrl*: string
+  ntfyUsername*: string
+  ntfyTokenConfigured*: bool
+  ntfyPasswordConfigured*: bool
+  smtpHost*: string
+  smtpPort*: int
+  smtpUsername*: string
+  smtpPasswordConfigured*: bool
+  smtpFromAddr*: string
+  smtpUseTls*: bool
+
 const EventsPageSize* = 20
+const MetricsChartPollMs = 15000
+const DefaultMetricRange* = "1h"
+
+proc browserNowMs(): int =
+  {.emit: "`result` = Date.now();".}
 
 var
   setupLoaded* = false
@@ -105,10 +131,16 @@ var
   metricsProjectId* = ""
   metricsSearch* = ""
   metricsSearchDraft* = ""
+  metricsRange* = DefaultMetricRange
   metricsPage* = 1
   metricsTotal* = 0
   metricsTotalPages* = 0
   metricsQueryKey* = ""
+  metricsRefreshInFlight* = false
+  metricsChartLoading* = false
+  metricsChartProjectId* = ""
+  metricsChartQueryKey* = ""
+  metricsChartLastLoadedAt* = 0
   metricsPolling* = false
   metricsPollingProjectId* = ""
   uptimeLoading* = false
@@ -122,6 +154,13 @@ var
   uptimeChecksTotalPages* = 0
   uptimePolling* = false
   uptimePollingProjectId* = ""
+  membersLoading* = false
+  membersSaving* = false
+  membersProjectId* = ""
+  settingsLoading* = false
+  settingsSaving* = false
+  profileSaving* = false
+  settingsLoaded* = false
   issueDetailLoading* = false
   issueDetailLoadedFor* = ""
   currentUser* = AuthUser()
@@ -130,8 +169,11 @@ var
   projectLogs* = newSeq[Issue]()
   breadcrumbLogs* = newSeq[Issue]()
   projectMetrics* = newSeq[Metric]()
+  projectMetricChartSamples* = newSeq[Metric]()
   projectUptimeMonitors* = newSeq[UptimeMonitor]()
   projectUptimeChecks* = newSeq[UptimeCheck]()
+  projectMembers* = newSeq[ProjectMember]()
+  appSettings* = AppSettings(ntfyServerUrl: "https://ntfy.sh", smtpUseTls: true)
   selectedIssue* = IssueDetail()
   authMessage* = ""
   copyFeedback* = ""
@@ -163,6 +205,9 @@ proc savedToken*(): string =
 
 proc isAuthenticated*(): bool =
   savedToken().len > 0 and currentUser.email.len > 0
+
+proc smtpConfigured*(): bool =
+  appSettings.smtpHost.strip().len > 0 and appSettings.smtpFromAddr.strip().len > 0
 
 proc clearCopyFeedback*() {.exportc.} =
   copyFeedback = ""
@@ -209,10 +254,16 @@ proc clearSession*() =
   metricsProjectId = ""
   metricsSearch = ""
   metricsSearchDraft = ""
+  metricsRange = DefaultMetricRange
   metricsPage = 1
   metricsTotal = 0
   metricsTotalPages = 0
   metricsQueryKey = ""
+  metricsRefreshInFlight = false
+  metricsChartLoading = false
+  metricsChartProjectId = ""
+  metricsChartQueryKey = ""
+  metricsChartLastLoadedAt = 0
   metricsPolling = false
   metricsPollingProjectId = ""
   uptimeLoading = false
@@ -226,12 +277,22 @@ proc clearSession*() =
   uptimeChecksTotalPages = 0
   uptimePolling = false
   uptimePollingProjectId = ""
+  membersLoading = false
+  membersSaving = false
+  membersProjectId = ""
+  settingsLoading = false
+  settingsSaving = false
+  profileSaving = false
+  settingsLoaded = false
   projectUptimeMonitors = @[]
   projectUptimeChecks = @[]
+  projectMembers = @[]
+  appSettings = AppSettings(ntfyServerUrl: "https://ntfy.sh", smtpUseTls: true)
   issueDetailLoadedFor = ""
   projectLogs = @[]
   breadcrumbLogs = @[]
   projectMetrics = @[]
+  projectMetricChartSamples = @[]
   selectedIssue = IssueDetail()
   copyFeedback = ""
 
@@ -265,6 +326,8 @@ proc parseProject(data: JsonNode): Project =
     ntfyTopic: if "ntfyTopic" in data: data["ntfyTopic"].getStr() else: "",
     ntfyUrl: if "ntfyUrl" in data: data["ntfyUrl"].getStr() else: "",
     webhookUrl: if "webhookUrl" in data: data["webhookUrl"].getStr() else: "",
+    emailEnabled: if "emailEnabled" in data: data["emailEnabled"].getBool() else: false,
+    emailToAddrs: if "emailToAddrs" in data: data["emailToAddrs"].getStr() else: "",
     issueCount: if "issueCount" in data: data["issueCount"].getInt() else: 0
   )
 
@@ -313,6 +376,28 @@ proc parseUptimeCheck(data: JsonNode): UptimeCheck =
     statusCode: data["statusCode"].getInt(),
     error: data["error"].getStr(),
     checkedAt: data["checkedAt"].getStr()
+  )
+
+proc parseProjectMember(data: JsonNode): ProjectMember =
+  ProjectMember(
+    id: data["id"].getStr(),
+    name: data["name"].getStr(),
+    email: data["email"].getStr(),
+    owner: if "owner" in data: data["owner"].getBool() else: false
+  )
+
+proc parseAppSettings(data: JsonNode): AppSettings =
+  AppSettings(
+    ntfyServerUrl: if "ntfyServerUrl" in data: data["ntfyServerUrl"].getStr() else: "https://ntfy.sh",
+    ntfyUsername: if "ntfyUsername" in data: data["ntfyUsername"].getStr() else: "",
+    ntfyTokenConfigured: if "ntfyTokenConfigured" in data: data["ntfyTokenConfigured"].getBool() else: false,
+    ntfyPasswordConfigured: if "ntfyPasswordConfigured" in data: data["ntfyPasswordConfigured"].getBool() else: false,
+    smtpHost: if "smtpHost" in data: data["smtpHost"].getStr() else: "",
+    smtpPort: if "smtpPort" in data: data["smtpPort"].getInt() else: 0,
+    smtpUsername: if "smtpUsername" in data: data["smtpUsername"].getStr() else: "",
+    smtpPasswordConfigured: if "smtpPasswordConfigured" in data: data["smtpPasswordConfigured"].getBool() else: false,
+    smtpFromAddr: if "smtpFromAddr" in data: data["smtpFromAddr"].getStr() else: "",
+    smtpUseTls: if "smtpUseTls" in data: data["smtpUseTls"].getBool() else: true
   )
 
 proc loadProfile*(goDashboard = false) =
@@ -365,6 +450,129 @@ proc loadProjects*() =
     redraw()
   )
 
+proc loadAppSettings*() =
+  if savedToken().len == 0:
+    return
+  if settingsLoading:
+    return
+
+  settingsLoading = true
+  ajaxGet(cstring"/api/settings/", authHeaders(), proc(status: int, response: cstring) =
+    settingsLoading = false
+    if status == 200:
+      appSettings = parseAppSettings(parseJson($response))
+      settingsLoaded = true
+      authMessage = ""
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to view settings."
+      navigate("/login")
+    else:
+      authMessage = "Unable to load settings."
+    redraw()
+  )
+
+proc updateAppSettings*(
+  ntfyServerUrl, ntfyUsername, ntfyPassword, ntfyToken: string,
+  clearNtfyPassword, clearNtfyToken: bool,
+  smtpHost, smtpPort, smtpUsername, smtpPassword, smtpFromAddr: string,
+  smtpUseTls, clearSmtpPassword: bool,
+  onDone: proc() {.closure.}
+) =
+  if savedToken().len == 0 or settingsSaving:
+    return
+
+  var portValue = 0
+  if smtpPort.strip().len > 0:
+    try:
+      portValue = parseInt(smtpPort.strip())
+    except ValueError:
+      authMessage = "SMTP port must be a number."
+      redraw()
+      return
+
+  settingsSaving = true
+  let body = $(%* {
+    "ntfyServerUrl": ntfyServerUrl.strip(),
+    "ntfyUsername": ntfyUsername.strip(),
+    "ntfyPassword": ntfyPassword,
+    "ntfyToken": ntfyToken,
+    "clearNtfyPassword": clearNtfyPassword,
+    "clearNtfyToken": clearNtfyToken,
+    "smtpHost": smtpHost.strip(),
+    "smtpPort": portValue,
+    "smtpUsername": smtpUsername.strip(),
+    "smtpPassword": smtpPassword,
+    "smtpFromAddr": smtpFromAddr.strip(),
+    "smtpUseTls": smtpUseTls,
+    "clearSmtpPassword": clearSmtpPassword
+  })
+  ajax(cstring"PATCH", cstring"/api/settings/", authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    settingsSaving = false
+    if status == 200:
+      appSettings = parseAppSettings(parseJson($response))
+      settingsLoaded = true
+      authMessage = ""
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update settings."
+      navigate("/login")
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to update settings."
+      except CatchableError:
+        authMessage = "Unable to update settings."
+    redraw()
+  )
+
+proc updateProfile*(
+  name, email, currentPassword, newPassword: string,
+  onDone: proc() {.closure.}
+) =
+  if savedToken().len == 0 or profileSaving:
+    return
+
+  profileSaving = true
+  let body = $(%* {
+    "name": name.strip(),
+    "email": email.strip(),
+    "currentPassword": currentPassword,
+    "newPassword": newPassword
+  })
+  ajax(cstring"PATCH", cstring"/api/profile/", authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    profileSaving = false
+    if status == 200:
+      let data = parseJson($response)
+      currentUser = AuthUser(
+        id: $data["id"].getInt(),
+        name: data["name"].getStr(),
+        email: data["email"].getStr()
+      )
+      if "token" in data:
+        setSessionToken(data["token"].getStr())
+      authMessage = ""
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update your account."
+      navigate("/login")
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to update account."
+      except CatchableError:
+        authMessage = "Unable to update account."
+    redraw()
+  )
+
 proc bootstrapSession*() =
   if savedToken().len == 0:
     return
@@ -381,6 +589,7 @@ proc parseIssueDetail(data: JsonNode): IssueDetail =
     level: data["level"].getStr(),
     platform: data["platform"].getStr(),
     receivedAt: data["receivedAt"].getStr(),
+    receivedAtUnix: if "receivedAtUnix" in data: data["receivedAtUnix"].getBiggestInt().int64 else: 0,
     stacktrace: data["stacktrace"].getStr()
   )
 
@@ -506,18 +715,65 @@ proc projectLogsHash*(projectId: string, search: string = "", page: int = 1): st
 proc projectLogsHref*(projectId: string, search: string = "", page: int = 1): string =
   "#" & projectLogsHash(projectId, search, page)
 
-proc projectMetricsHash*(projectId: string, search: string = "", page: int = 1): string =
+proc normalizeMetricRange*(raw: string): string =
+  case raw.strip().toLowerAscii()
+  of "1minute", "1min", "1m", "minute":
+    "1m"
+  of "5minute", "5minutes", "5min", "5m":
+    "5m"
+  of "10minute", "10minutes", "10min", "10m":
+    "10m"
+  of "hour", "1hour", "1h", "60m":
+    "1h"
+  of "24hour", "24hours", "24h", "1day", "1d", "day":
+    "24h"
+  of "week", "1week", "7day", "7days", "7d":
+    "7d"
+  of "14day", "14days", "14d":
+    "14d"
+  of "1month", "month", "30day", "30days", "30d":
+    "30d"
+  of "all":
+    "all"
+  else:
+    DefaultMetricRange
+
+proc metricRangeLabel*(metricRange: string): string =
+  case normalizeMetricRange(metricRange)
+  of "1m":
+    "1 minute"
+  of "5m":
+    "5 minutes"
+  of "10m":
+    "10 minutes"
+  of "1h":
+    "1 hour"
+  of "24h":
+    "24 hours"
+  of "7d":
+    "7 days"
+  of "14d":
+    "14 days"
+  of "30d":
+    "1 month"
+  else:
+    "All"
+
+proc projectMetricsHash*(projectId: string, search: string = "", page: int = 1, metricRange: string = DefaultMetricRange): string =
   result = "/projects/" & projectId & "/metrics"
   var parts: seq[string] = @[]
   if search.len > 0:
     parts.add "search=" & encodeQueryComponent(search)
+  let rangeValue = normalizeMetricRange(metricRange)
+  if rangeValue != DefaultMetricRange:
+    parts.add "range=" & encodeQueryComponent(rangeValue)
   if page > 1:
     parts.add "page=" & $page
   if parts.len > 0:
     result &= "?" & parts.join("&")
 
-proc projectMetricsHref*(projectId: string, search: string = "", page: int = 1): string =
-  "#" & projectMetricsHash(projectId, search, page)
+proc projectMetricsHref*(projectId: string, search: string = "", page: int = 1, metricRange: string = DefaultMetricRange): string =
+  "#" & projectMetricsHash(projectId, search, page, metricRange)
 
 proc projectUptimeHash*(projectId: string): string =
   "/projects/" & projectId & "/uptime"
@@ -534,8 +790,8 @@ proc navigateProjectEvents*(projectId: string, search: string = "", page: int = 
 proc navigateProjectLogs*(projectId: string, search: string = "", page: int = 1) =
   setHash(cstring(projectLogsHash(projectId, search, page)))
 
-proc navigateProjectMetrics*(projectId: string, search: string = "", page: int = 1) =
-  setHash(cstring(projectMetricsHash(projectId, search, page)))
+proc navigateProjectMetrics*(projectId: string, search: string = "", page: int = 1, metricRange: string = DefaultMetricRange) =
+  setHash(cstring(projectMetricsHash(projectId, search, page, metricRange)))
 
 proc buildEventsPath(projectId: string, search: string, page, pageSize: int): string =
   result = "/api/projects/" & projectId & "/events/?page=" & $page & "&pageSize=" & $pageSize
@@ -547,10 +803,27 @@ proc buildLogsPath(projectId: string, search: string, page, pageSize: int): stri
   if search.len > 0:
     result &= "&search=" & encodeQueryComponent(search)
 
-proc buildMetricsPath(projectId: string, search: string, page, pageSize: int): string =
+proc buildMetricsPath(projectId: string, search: string, page, pageSize: int, metricRange: string = DefaultMetricRange): string =
   result = "/api/projects/" & projectId & "/metrics/?page=" & $page & "&pageSize=" & $pageSize
+  result &= "&range=" & encodeQueryComponent(normalizeMetricRange(metricRange))
   if search.len > 0:
     result &= "&search=" & encodeQueryComponent(search)
+
+proc buildMetricsWindowPath(projectId: string, pageSize: int, metricRange: string, untilUnix: int64): string =
+  result = buildMetricsPath(projectId, "", 1, pageSize, metricRange)
+  if untilUnix > 0:
+    result &= "&until=" & $untilUnix
+
+proc metricChartPageSize(metricRange: string): int =
+  case normalizeMetricRange(metricRange)
+  of "1m", "5m", "10m":
+    300
+  of "1h":
+    800
+  of "24h":
+    2000
+  else:
+    5000
 
 proc loadProjectEvents*(projectId: string, search: string = "", page: int = 1, pageSize: int = EventsPageSize) =
   if savedToken().len == 0:
@@ -625,14 +898,28 @@ proc loadProjectLogs*(projectId: string, search: string = "", page: int = 1, pag
     redraw()
   )
 
-proc loadProjectMetrics*(projectId: string, search: string = "", page: int = 1, pageSize: int = EventsPageSize) =
+proc loadProjectMetrics*(
+  projectId: string,
+  search: string = "",
+  page: int = 1,
+  pageSize: int = EventsPageSize,
+  showLoading: bool = true,
+  metricRange: string = DefaultMetricRange
+) =
   if savedToken().len == 0:
     return
+  if metricsRefreshInFlight:
+    return
 
-  metricsLoading = true
-  let path = cstring(buildMetricsPath(projectId, search, page, pageSize))
+  metricsRefreshInFlight = true
+  if showLoading:
+    metricsLoading = true
+  let rangeValue = normalizeMetricRange(metricRange)
+  let path = cstring(buildMetricsPath(projectId, search, page, pageSize, rangeValue))
   ajaxGet(path, authHeaders(), proc(status: int, response: cstring) =
-    metricsLoading = false
+    metricsRefreshInFlight = false
+    if showLoading:
+      metricsLoading = false
     if status == 200:
       let data = parseJson($response)
       projectMetrics = @[]
@@ -640,6 +927,7 @@ proc loadProjectMetrics*(projectId: string, search: string = "", page: int = 1, 
         projectMetrics.add parseMetric(item)
       metricsProjectId = projectId
       metricsSearch = search
+      metricsRange = rangeValue
       metricsPage = page
       if "pagination" in data:
         metricsTotal = data["pagination"]["total"].getInt()
@@ -647,7 +935,7 @@ proc loadProjectMetrics*(projectId: string, search: string = "", page: int = 1, 
       else:
         metricsTotal = projectMetrics.len
         metricsTotalPages = if metricsTotal > 0: 1 else: 0
-      metricsQueryKey = projectId & "|" & search & "|" & $page
+      metricsQueryKey = projectId & "|" & search & "|" & rangeValue & "|" & $page
       authMessage = ""
     elif status == 401:
       clearSession()
@@ -658,6 +946,186 @@ proc loadProjectMetrics*(projectId: string, search: string = "", page: int = 1, 
       navigate("/dashboard")
     else:
       authMessage = "Unable to load metrics."
+    redraw()
+  )
+
+proc loadProjectMetricChartSamples*(projectId: string, search: string = "", pageSize: int = 0, metricRange: string = DefaultMetricRange) =
+  if savedToken().len == 0 or projectId.len == 0:
+    return
+
+  metricsChartLoading = true
+  let rangeValue = normalizeMetricRange(metricRange)
+  let samplePageSize =
+    if pageSize > 0:
+      pageSize
+    else:
+      metricChartPageSize(rangeValue)
+  let requestedKey = projectId & "|" & search & "|" & rangeValue
+  let path = cstring(buildMetricsPath(projectId, search, 1, samplePageSize, rangeValue))
+  ajaxGet(path, authHeaders(), proc(status: int, response: cstring) =
+    if metricsProjectId != projectId or metricsSearch != search or metricsRange != rangeValue:
+      return
+
+    metricsChartLoading = false
+    if status == 200:
+      let data = parseJson($response)
+      projectMetricChartSamples = @[]
+      for item in data["metrics"]:
+        projectMetricChartSamples.add parseMetric(item)
+      metricsChartProjectId = projectId
+      metricsChartQueryKey = requestedKey
+      metricsChartLastLoadedAt = browserNowMs()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to view metrics."
+      navigate("/login")
+    elif status == 404:
+      authMessage = "Project not found."
+      navigate("/dashboard")
+    redraw()
+  )
+
+proc loadProjectMetricChartWindowSamples*(projectId: string, untilUnix: int64, metricRange: string = "10m") =
+  if savedToken().len == 0 or projectId.len == 0 or untilUnix <= 0:
+    return
+
+  metricsChartLoading = true
+  let rangeValue = normalizeMetricRange(metricRange)
+  let requestedKey = projectId & "|detail|" & rangeValue & "|" & $untilUnix
+  let path = cstring(buildMetricsWindowPath(projectId, metricChartPageSize(rangeValue), rangeValue, untilUnix))
+  ajaxGet(path, authHeaders(), proc(status: int, response: cstring) =
+    if selectedIssue.receivedAtUnix != untilUnix:
+      return
+
+    metricsChartLoading = false
+    if status == 200:
+      let data = parseJson($response)
+      projectMetricChartSamples = @[]
+      for item in data["metrics"]:
+        projectMetricChartSamples.add parseMetric(item)
+      metricsChartProjectId = projectId
+      metricsChartQueryKey = requestedKey
+      metricsChartLastLoadedAt = browserNowMs()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to view metrics."
+      navigate("/login")
+    redraw()
+  )
+
+proc loadProjectMembers*(projectId: string) =
+  if savedToken().len == 0 or projectId.len == 0:
+    return
+  if membersLoading:
+    return
+
+  membersLoading = true
+  let path = cstring("/api/projects/" & projectId & "/members/")
+  ajaxGet(path, authHeaders(), proc(status: int, response: cstring) =
+    membersLoading = false
+    if status == 200:
+      let data = parseJson($response)
+      projectMembers = @[]
+      for item in data["members"]:
+        projectMembers.add parseProjectMember(item)
+      membersProjectId = projectId
+      authMessage = ""
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to view project members."
+      navigate("/login")
+    elif status == 404:
+      authMessage = "Project not found."
+    else:
+      authMessage = "Unable to load project members."
+    redraw()
+  )
+
+proc saveProjectMember*(
+  projectId, name, email: string,
+  onDone: proc() {.closure.}
+) =
+  if savedToken().len == 0 or membersSaving:
+    return
+
+  membersSaving = true
+  let body = $(%* {
+    "name": name.strip(),
+    "email": email.strip()
+  })
+  let path = cstring("/api/projects/" & projectId & "/members/")
+  ajax(cstring"POST", path, authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    membersSaving = false
+    if status == 200:
+      authMessage = ""
+      loadProjectMembers(projectId)
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update project members."
+      navigate("/login")
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to save project member."
+      except CatchableError:
+        authMessage = "Unable to save project member."
+    redraw()
+  )
+
+proc inviteUser*(
+  name, email: string,
+  onDone: proc() {.closure.}
+) =
+  if savedToken().len == 0 or membersSaving:
+    return
+
+  membersSaving = true
+  let body = $(%* {
+    "name": name.strip(),
+    "email": email.strip()
+  })
+  ajax(cstring"POST", cstring"/api/invites/", authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    membersSaving = false
+    if status == 200:
+      authMessage = ""
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to invite users."
+      navigate("/login")
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to invite user."
+      except CatchableError:
+        authMessage = "Unable to invite user."
+    redraw()
+  )
+
+proc removeProjectMember*(projectId, memberId: string) =
+  if savedToken().len == 0 or membersSaving:
+    return
+
+  membersSaving = true
+  let path = cstring("/api/projects/" & projectId & "/members/" & memberId & "/")
+  ajax(cstring"DELETE", path, authHeaders(), cstring"", proc(status: int, response: cstring) =
+    membersSaving = false
+    if status == 200:
+      authMessage = ""
+      loadProjectMembers(projectId)
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update project members."
+      navigate("/login")
+    else:
+      authMessage = "Unable to remove project member."
     redraw()
   )
 
@@ -680,8 +1148,22 @@ proc searchProjectMetrics*(search: string) =
   if metricsProjectId.len == 0:
     return
   let term = search.strip()
-  navigateProjectMetrics(metricsProjectId, term, 1)
-  loadProjectMetrics(metricsProjectId, term, 1)
+  navigateProjectMetrics(metricsProjectId, term, 1, metricsRange)
+  loadProjectMetrics(metricsProjectId, term, 1, metricRange = metricsRange)
+
+proc setProjectMetricsRange*(metricRange: string) =
+  if metricsProjectId.len == 0:
+    return
+  let rangeValue = normalizeMetricRange(metricRange)
+  metricsRange = rangeValue
+  metricsPage = 1
+  metricsQueryKey = ""
+  metricsChartQueryKey = ""
+  metricsChartLastLoadedAt = 0
+  projectMetricChartSamples = @[]
+  navigateProjectMetrics(metricsProjectId, metricsSearch, 1, rangeValue)
+  loadProjectMetrics(metricsProjectId, metricsSearch, 1, metricRange = rangeValue)
+  loadProjectMetricChartSamples(metricsProjectId, metricsSearch, metricRange = rangeValue)
 
 proc goToEventsPage*(page: int) =
   if eventsProjectId.len == 0:
@@ -711,8 +1193,8 @@ proc goToMetricsPage*(page: int) =
     return
   if metricsTotalPages > 0 and page > metricsTotalPages:
     return
-  navigateProjectMetrics(metricsProjectId, metricsSearch, page)
-  loadProjectMetrics(metricsProjectId, metricsSearch, page)
+  navigateProjectMetrics(metricsProjectId, metricsSearch, page, metricsRange)
+  loadProjectMetrics(metricsProjectId, metricsSearch, page, metricRange = metricsRange)
 
 proc stopProjectLogsPolling*() =
   logsPolling = false
@@ -761,8 +1243,13 @@ proc pollProjectMetrics*() {.exportc.} =
   if metricsPollingProjectId.len == 0 or savedToken().len == 0:
     stopProjectMetricsPolling()
     return
-  if not metricsLoading:
-    loadProjectMetrics(metricsPollingProjectId, metricsSearch, metricsPage)
+
+  if not metricsRefreshInFlight:
+    loadProjectMetrics(metricsPollingProjectId, metricsSearch, metricsPage, showLoading = false, metricRange = metricsRange)
+
+  let now = browserNowMs()
+  if not metricsChartLoading and now - metricsChartLastLoadedAt >= MetricsChartPollMs:
+    loadProjectMetricChartSamples(metricsPollingProjectId, metricsSearch, metricRange = metricsRange)
 
 proc startProjectMetricsPolling*(projectId: string) =
   if savedToken().len == 0 or projectId.len == 0:
@@ -1212,5 +1699,39 @@ proc updateProjectWebhookUrl*(projectId, webhookUrl: string, onDone: proc() {.cl
       except CatchableError:
         authMessage = "Unable to update webhook."
     onDone()
+    redraw()
+  )
+
+proc updateProjectEmailSettings*(projectId: string, emailEnabled: bool, emailToAddrs: string, onDone: proc() {.closure.}) =
+  authMessage = ""
+  let body = $(%* {
+    "emailEnabled": emailEnabled,
+    "emailToAddrs": emailToAddrs.strip()
+  })
+  let path = cstring("/api/projects/" & projectId & "/")
+  ajax(cstring"PATCH", path, authHeaders(), cstring(body), proc(status: int, response: cstring) =
+    if status == 200:
+      let data = parseJson($response)
+      for i, project in projects:
+        if project.id == projectId:
+          projects[i] = parseProject(data)
+          break
+      authMessage = ""
+      onDone()
+    elif status == 401:
+      clearSession()
+      authMessage = "Sign in to update this project."
+      navigate("/login")
+    elif status == 404:
+      authMessage = "Project not found."
+    else:
+      try:
+        let data = parseJson($response)
+        if "error" in data:
+          authMessage = data["error"].getStr()
+        else:
+          authMessage = "Unable to update email settings."
+      except CatchableError:
+        authMessage = "Unable to update email settings."
     redraw()
   )

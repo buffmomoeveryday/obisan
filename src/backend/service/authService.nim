@@ -4,10 +4,10 @@ import options
 import os
 import strutils
 import times
-import norm/[pool, sqlite]
 import std/sha1
 
 import ../database/db
+import ./dbService
 import ../utils/jwtUtils
 
 proc getJwtSecret(): string =
@@ -46,6 +46,44 @@ proc hashPassword*(password: string): string =
 proc verifyPassword*(password, hash: string): bool =
   result = hashPassword(password) == hash
 
+proc userFromRow(row: seq[DbValue]): User =
+  result = User(
+    name: dbText(row[0]),
+    email: dbText(row[1]),
+    passwordHash: dbText(row[2])
+  )
+  result.id = row[3].i.int
+
+proc findAnyUser*(db: DbConn): Option[User] =
+  let row = db.getRow(
+    dbSql"SELECT name, email, passwordHash, id FROM users WHERE id > ? LIMIT 1",
+    0
+  )
+  if row.isSome:
+    some(userFromRow(row.get))
+  else:
+    none[User]()
+
+proc findUserById*(db: DbConn, userId: int): Option[User] =
+  let row = db.getRow(
+    dbSql"SELECT name, email, passwordHash, id FROM users WHERE id = ? LIMIT 1",
+    userId
+  )
+  if row.isSome:
+    some(userFromRow(row.get))
+  else:
+    none[User]()
+
+proc findUserByEmail*(db: DbConn, email: string): Option[User] =
+  let row = db.getRow(
+    dbSql"SELECT name, email, passwordHash, id FROM users WHERE email = ? LIMIT 1",
+    email
+  )
+  if row.isSome:
+    some(userFromRow(row.get))
+  else:
+    none[User]()
+
 proc verifyJwtToken(token: string): Option[int] =
   try:
     let payload = decodeJwt(token, JWT_SECRET)
@@ -69,25 +107,25 @@ proc getUser*(request: Request): Option[User] =
   if maybeUserId.isNone:
     return none[User]()
 
-  var dbUser = User()
+  var dbUser: Option[User]
   withDb dbPool:
-    db.select(dbUser, "id = ?", maybeUserId.get)
+    dbUser = findUserById(db, maybeUserId.get)
 
-  if dbUser == nil:
+  if dbUser.isNone:
     return none[User]()
 
-  return some(dbUser)
+  return dbUser
 
 proc getUserFromToken*(token: string): Option[User] =
   let maybeUserId = verifyJwtToken(token)
   if maybeUserId.isNone:
     return none[User]()
 
-  var dbUser = User()
+  var dbUser: Option[User]
   withDb dbPool:
-    db.select(dbUser, "id = ?", maybeUserId.get)
+    dbUser = findUserById(db, maybeUserId.get)
 
-  if dbUser == nil:
+  if dbUser.isNone:
     return none[User]()
 
-  some(dbUser)
+  dbUser

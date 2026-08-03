@@ -3,6 +3,18 @@ import chronicles
 
 const WebhookTimeoutMs* = 5000
 
+proc shouldSendLogWebhook(payload: JsonNode): bool =
+  if payload.kind != JObject or "data" notin payload or payload["data"].kind != JObject:
+    return false
+  let data = payload["data"]
+  if "level" notin data or data["level"].kind != JString:
+    return false
+  case data["level"].getStr().toLowerAscii()
+  of "error", "fatal", "critical":
+    true
+  else:
+    false
+
 proc normalizeWebhookUrl*(raw: string): string =
   result = raw.strip()
   if result.len == 0:
@@ -15,6 +27,9 @@ proc normalizeWebhookUrl*(raw: string): string =
 
 proc postToWebhook*(url, eventType: string, payload: JsonNode) =
   if url.len == 0:
+    return
+  if eventType == "log.created" and not shouldSendLogWebhook(payload):
+    info "Skipped webhook for non-error log", eventType = eventType
     return
 
   let client = newHttpClient(timeout = WebhookTimeoutMs)

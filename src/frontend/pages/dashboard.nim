@@ -34,6 +34,8 @@ proc render*(context: Context): VNode =
           p(class="mt-1 text-sm text-slate-600"):
             text "Name each project for readable alerts and ntfy.sh topics."
         tdiv(class="flex flex-wrap items-end gap-2"):
+          a(class="rounded border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50", href="#/invite"):
+            text "Invite user"
           tdiv:
             label(class="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500"):
               text "Project name"

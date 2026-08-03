@@ -4,7 +4,7 @@ const
   DefaultEventsPageSize* = 20
   DefaultMetricsPageSize* = 50
   MaxEventsPageSize* = 100
-  MaxMetricsPageSize* = 200
+  MaxMetricsPageSize* = 5000
   MaxEventSearchLen* = 200
   MaxDeleteBatch* = 100
 

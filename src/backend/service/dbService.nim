@@ -1,5 +1,5 @@
 import std/times
-import lowdb/sqlite
+import ../database/dbBackend
 
 proc dbText*(value: DbValue): string =
   if value.kind == dvkNull:

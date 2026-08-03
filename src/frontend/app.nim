@@ -1,6 +1,6 @@
 import kraut
 import karax/[karax, karaxdsl, vdom]
-import ./pages/[dashboard, home, issue, login, logs, metrics, project, register, uptime]
+import ./pages/[dashboard, home, invite, issue, login, logs, metrics, project, register, settings, uptime]
 import ./utils/auth
 
 
@@ -9,7 +9,10 @@ const routes = {
   "/register": register.render,
   "/login": login.render,
   "/dashboard": dashboard.render,
+  "/settings": settings.render,
+  "/invite": invite.renderWorkspace,
   "/projects/{id}": project.render,
+  "/projects/{id}/invite": invite.render,
   "/projects/{id}/logs": logs.render,
   "/projects/{id}/metrics": metrics.render,
   "/projects/{id}/uptime": uptime.render,

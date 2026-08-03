@@ -5,14 +5,11 @@ import times
 import os
 import httpclient
 import uuid4
-import norm/[pool, sqlite]
-import lowdb/sqlite
 
 import ../database/db
-import ../utils/ntfy
-import ../utils/webhook
 import ./dbService
 import ./uptimeStore
+import ./notification/notificationService
 
 const
   DefaultTimeoutMs* = 5000
@@ -200,35 +197,52 @@ proc executeMonitorCheck*(monitorId: string) =
   let name = doc["name"].getStr()
   let url = doc["url"].getStr()
   if previousStatus.len > 0 and previousStatus != "unknown" and previousStatus != result.status:
-    if result.status == "down":
-      let body = name & " is DOWN\n" & url & "\n" & result.error
-      postToNtfy(ntfyTopic, body, "Uptime alert: " & name)
-    elif result.status == "up":
-      let body = name & " is back UP (" & $result.responseMs & "ms)\n" & url
-      postToNtfy(ntfyTopic, body, "Uptime recovered: " & name)
-
+    let projectId = doc["projectId"].getStr()
     var projectName = ""
     var projectWebhookUrl = ""
-    let projectId = doc["projectId"].getStr()
+    var projectNotificationConfigs = ""
     withDb dbPool:
-      let projectRow = db.getRow(sql"SELECT name, webhookUrl FROM Project WHERE id = ?", projectId)
+      let projectRow = db.getRow(dbSql"SELECT name, webhookUrl, notificationConfigs FROM projects WHERE id = ?", projectId)
       if projectRow.isSome:
         projectName = dbText(projectRow.get[0])
         projectWebhookUrl = dbText(projectRow.get[1])
-    if projectWebhookUrl.len > 0:
-      let data = %* {
-        "monitorId": monitorId,
-        "name": name,
-        "url": url,
-        "previousStatus": previousStatus,
-        "status": result.status,
-        "responseMs": result.responseMs,
-        "statusCode": result.statusCode,
-        "error": result.error,
-        "checkedAt": checkedAt
-      }
-      let payload = webhookPayload("uptime.status_changed", projectId, projectName, data)
-      postToWebhook(projectWebhookUrl, "uptime.status_changed", payload)
+        projectNotificationConfigs = dbText(projectRow.get[2])
+
+    let data = %* {
+      "monitorId": monitorId,
+      "name": name,
+      "url": url,
+      "previousStatus": previousStatus,
+      "status": result.status,
+      "responseMs": result.responseMs,
+      "statusCode": result.statusCode,
+      "error": result.error,
+      "checkedAt": checkedAt
+    }
+
+    let title = if result.status == "down": "Uptime alert: " & name else: "Uptime recovered: " & name
+    let body = if result.status == "down":
+      name & " is DOWN\n" & url & "\n" & result.error
+    else:
+      name & " is back UP (" & $result.responseMs & "ms)\n" & url
+
+    let priority = if result.status == "down": npHigh else: npNormal
+    let notifService = buildProjectNotificationService(
+      ntfyTopic,
+      projectWebhookUrl,
+      projectNotificationConfigs,
+      projectName = projectName
+    )
+    let notifMsg = NotificationMessage(
+      title: title,
+      body: body,
+      priority: priority,
+      eventType: "uptime.status_changed",
+      projectId: projectId,
+      projectName: projectName,
+      data: data
+    )
+    notifService.notify(notifMsg)
 
 proc listMonitors*(projectId: string): seq[JsonNode] =
   for doc in listMonitorsForProject(projectId):

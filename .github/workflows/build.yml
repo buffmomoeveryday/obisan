@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: obisan-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: obisan-linux-arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libsqlite3-dev liblmdb-dev
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.0.8"
+
+      - name: Build frontend
+        run: nimble -y build_frontend
+
+      - name: Build backend
+        run: nimble -y build_backend
+
+      - name: Rename backend binary
+        run: |
+          mkdir -p dist
+          cp bin/obisan "dist/${{ matrix.artifact }}"
+          cp bin/app.js dist/app.js
+          cp src/frontend/index.html dist/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/

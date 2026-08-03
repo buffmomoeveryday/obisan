@@ -2,13 +2,11 @@ import json
 import options
 import strutils
 import times
-import norm/[pool, sqlite]
-import lowdb/sqlite
 
 import ../database/db
-import ../utils/webhook
 import ./dbService
 import ./queryService
+import ./projectService
 
 type MetricInput* = object
   name: string
@@ -174,58 +172,100 @@ proc parseMetricsPayload*(body: string): seq[MetricInput] =
   if result.len > 500:
     raise newException(ValueError, "Too many metrics in one request")
 
-proc saveMetricsPayload*(projectDbId: int, body: string): int =
-  let metrics = parseMetricsPayload(body)
-  var project = Project(publicKey: "", ntfyTopic: "", webhookUrl: "", owner: User())
-  project.id = projectDbId
+proc metricsToQueuePayload*(metrics: openArray[MetricInput]): string =
+  result = "["
+  for index, metric in metrics:
+    if index > 0:
+      result.add ","
+    result.add "{"
+    result.add "\"name\":" & escapeJson(metric.name) & ","
+    result.add "\"metricType\":" & escapeJson(metric.metricType) & ","
+    result.add "\"value\":" & $metric.value & ","
+    result.add "\"unit\":" & escapeJson(metric.unit) & ","
+    result.add "\"tagsJson\":" & escapeJson(metric.tagsJson) & ","
+    result.add "\"receivedAt\":" & $metric.receivedAt
+    result.add "}"
+  result.add "]"
+
+proc parseQueuedMetricsNode*(data: JsonNode): seq[MetricInput] =
+  if data.kind != JArray:
+    raise newException(ValueError, "Queued metrics payload must be an array")
+
+  for item in data:
+    if item.kind != JObject:
+      continue
+    let value = item.nodeFloat("value")
+    if value.isNone:
+      continue
+    result.add MetricInput(
+      name: normalizeMetricName(item.nodeText("name")),
+      metricType: normalizeMetricType(item.nodeTextDefault("gauge", "metricType", "type")),
+      value: value.get,
+      unit: item.nodeText("unit"),
+      tagsJson: item.nodeTextDefault("{}", "tagsJson"),
+      receivedAt: int64(item.nodeFloat("receivedAt").get(getTime().toUnix().float))
+    )
+
+  if result.len == 0:
+    raise newException(ValueError, "No queued metrics found")
+  if result.len > 500:
+    raise newException(ValueError, "Too many metrics in one queued payload")
+
+proc parseQueuedMetricsPayload*(body: string): seq[MetricInput] =
+  if body.len == 0:
+    raise newException(ValueError, "Queued metrics payload required")
+  parseQueuedMetricsNode(parseJson(body))
+
+proc saveMetricsBatch*(projectDbId: int, metrics: openArray[MetricInput]): int =
   var projectName = ""
-  var projectWebhookUrl = ""
 
   withDb dbPool:
-    let projectRow = db.getRow(sql"SELECT name, webhookUrl FROM Project WHERE id = ?", projectDbId)
+    let projectRow = db.getRow(dbSql"SELECT name FROM projects WHERE id = ?", projectDbId)
     if projectRow.isSome:
       projectName = dbText(projectRow.get[0])
-      projectWebhookUrl = dbText(projectRow.get[1])
-    for metric in metrics:
-      var record = newProjectMetric(
-        project,
-        metric.name,
-        metric.metricType,
-        metric.value,
-        metric.unit,
-        metric.tagsJson,
-        metric.receivedAt
-      )
-      db.insert(record)
-      inc result
+    db.exec(dbSql"BEGIN")
+    try:
+      for metric in metrics:
+        db.exec(
+          dbSql"""INSERT INTO project_metrics
+                (project, name, metricType, value, unit, tagsJson, receivedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+          projectDbId,
+          metric.name,
+          metric.metricType,
+          metric.value,
+          metric.unit,
+          metric.tagsJson,
+          metric.receivedAt
+        )
+        inc result
+      db.exec(dbSql"COMMIT")
+    except CatchableError:
+      db.exec(dbSql"ROLLBACK")
+      raise
 
-  if projectWebhookUrl.len > 0 and metrics.len > 0:
-    var metricItems = newJArray()
-    for metric in metrics:
-      add(metricItems, %* {
-        "name": metric.name,
-        "type": metric.metricType,
-        "value": metric.value,
-        "unit": metric.unit,
-        "tags": parseJson(metric.tagsJson),
-        "receivedAt": metric.receivedAt
-      })
-    let payload = webhookPayload(
-      "metrics.ingested",
-      $projectDbId,
-      projectName,
-      %* {"metrics": metricItems, "count": metrics.len}
-    )
-    postToWebhook(projectWebhookUrl, "metrics.ingested", payload)
+  # Notifications for metrics ingestion are intentionally disabled —
+  # they would flood notification channels under normal/high throughput.
 
-proc countProjectMetrics*(db: DbConn, projectDbId: int, search: string): int =
+proc saveMetricsPayload*(projectDbId: int, body: string): int =
+  let metrics = parseMetricsPayload(body)
+  saveMetricsBatch(projectDbId, metrics)
+
+
+proc countProjectMetrics*(db: DbConn, projectDbId: int, search: string, sinceUnix: int64 = 0): int =
   let row =
-    if search.len == 0:
-      db.getRow(sql"SELECT COUNT(*) FROM ProjectMetric WHERE project = ?", projectDbId)
-    else:
+    if search.len == 0 and sinceUnix <= 0:
+      db.getRow(dbSql"SELECT COUNT(*) FROM project_metrics WHERE project = ?", projectDbId)
+    elif search.len == 0:
+      db.getRow(
+        dbSql"SELECT COUNT(*) FROM project_metrics WHERE project = ? AND receivedAt >= ?",
+        projectDbId,
+        sinceUnix
+      )
+    elif sinceUnix <= 0:
       let pattern = likePattern(search)
       db.getRow(
-        sql"""SELECT COUNT(*) FROM ProjectMetric
+        dbSql"""SELECT COUNT(*) FROM project_metrics
               WHERE project = ?
               AND (
                 name LIKE ?
@@ -234,6 +274,25 @@ proc countProjectMetrics*(db: DbConn, projectDbId: int, search: string): int =
                 OR tagsJson LIKE ?
               )""",
         projectDbId,
+        pattern,
+        pattern,
+        pattern,
+        pattern
+      )
+    else:
+      let pattern = likePattern(search)
+      db.getRow(
+        dbSql"""SELECT COUNT(*) FROM project_metrics
+              WHERE project = ?
+              AND receivedAt >= ?
+              AND (
+                name LIKE ?
+                OR metricType LIKE ?
+                OR unit LIKE ?
+                OR tagsJson LIKE ?
+              )""",
+        projectDbId,
+        sinceUnix,
         pattern,
         pattern,
         pattern,
@@ -255,14 +314,32 @@ proc metricSummaryJson*(row: seq[DbValue]): JsonNode =
     "receivedAt": formatUnixTime(row[6].i.int64)
   }
 
-const metricSummarySql* = sql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
-                                FROM ProjectMetric
+proc metricSummaryJsonText*(row: seq[DbValue]): string =
+  result = "{"
+  result &= "\"id\":" & escapeJson($row[0].i) & ","
+  result &= "\"name\":" & escapeJson(dbText(row[1])) & ","
+  result &= "\"type\":" & escapeJson(dbText(row[2])) & ","
+  result &= "\"value\":" & $row[3].f & ","
+  result &= "\"unit\":" & escapeJson(dbText(row[4])) & ","
+  result &= "\"tags\":" & escapeJson(dbText(row[5])) & ","
+  result &= "\"receivedAt\":" & escapeJson(formatUnixTime(row[6].i.int64))
+  result &= "}"
+
+const metricSummarySql* = dbSql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
+                                FROM project_metrics
                                 WHERE project = ?
                                 ORDER BY receivedAt DESC, id DESC
                                 LIMIT ? OFFSET ?"""
 
-const metricSummarySearchSql* = sql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
-                                      FROM ProjectMetric
+const metricSummarySinceSql* = dbSql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
+                                     FROM project_metrics
+                                     WHERE project = ?
+                                     AND receivedAt >= ?
+                                     ORDER BY receivedAt DESC, id DESC
+                                     LIMIT ? OFFSET ?"""
+
+const metricSummarySearchSql* = dbSql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
+                                      FROM project_metrics
                                       WHERE project = ?
                                       AND (
                                         name LIKE ?
@@ -270,5 +347,26 @@ const metricSummarySearchSql* = sql"""SELECT id, name, metricType, value, unit, 
                                         OR unit LIKE ?
                                         OR tagsJson LIKE ?
                                       )
+                                      ORDER BY receivedAt DESC, id DESC
+                                      LIMIT ? OFFSET ?"""
+
+const metricSummarySearchSinceSql* = dbSql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
+                                           FROM project_metrics
+                                           WHERE project = ?
+                                           AND receivedAt >= ?
+                                           AND (
+                                             name LIKE ?
+                                             OR metricType LIKE ?
+                                             OR unit LIKE ?
+                                             OR tagsJson LIKE ?
+                                           )
+                                           ORDER BY receivedAt DESC, id DESC
+                                           LIMIT ? OFFSET ?"""
+
+const metricSummaryWindowSql* = dbSql"""SELECT id, name, metricType, value, unit, tagsJson, receivedAt
+                                      FROM project_metrics
+                                      WHERE project = ?
+                                      AND receivedAt >= ?
+                                      AND receivedAt <= ?
                                       ORDER BY receivedAt DESC, id DESC
                                       LIMIT ? OFFSET ?"""

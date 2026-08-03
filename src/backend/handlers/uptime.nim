@@ -3,7 +3,6 @@ import json
 import chronicles
 import strutils
 import options
-import norm/[pool, sqlite]
 
 import ../database/db
 import ../utils/http
@@ -24,7 +23,7 @@ proc listProjectUptimeMonitors*(request: Request) =
   try:
     var projectDbId = ""
     withDb dbPool:
-      let projectInfo = selectOwnedProject(db, projectId, user.get.id)
+      let projectInfo = selectOwnedProject(db, projectId, user.get.id.int)
       if projectInfo.isNone:
         request.respond(404, newJsonHeaders(), (%* {"error": "Project not found"}).pretty)
         return
@@ -95,7 +94,7 @@ proc createProjectUptimeMonitor*(request: Request) =
     var projectDbId = ""
     var ntfyTopic = ""
     withDb dbPool:
-      let projectInfo = selectOwnedProject(db, projectId, user.get.id)
+      let projectInfo = selectOwnedProject(db, projectId, user.get.id.int)
       if projectInfo.isNone:
         request.respond(404, newJsonHeaders(), (%* {"error": "Project not found"}).pretty)
         return

@@ -2,19 +2,86 @@ import mummy
 import json
 import jsony
 import chronicles
-import std/[options, strformat, strutils, times]
+import std/[locks, options, strformat, strutils, tables, times]
 import uuid4
 import zippy
 
 import ../database/db
-import norm/[pool, sqlite]
-import lowdb/sqlite
 import ../tasks/tasks
-import ../utils/webhook
+import ./projectService
+import ./notification/notificationService
+import ./notification/webhook
 import ../../shared/types/sentry
 import ./requestService
 
-const DuplicateWindowSecs = 2'i64
+const
+  DuplicateWindowSecs = 2'i64
+  SentryEnvelopeQueueSize = 4096
+  SentryEnvelopeWorkerCount = 4
+  SentryEnvelopeBatchSize = 128
+  DuplicateCacheMaxEntries = 20000
+
+type SentryEnvelopeJob = ref object
+  projectDbId: int
+  projectIdStr: string
+  projectName: string
+  ntfyTopic: string
+  webhookUrl: string
+  notificationConfigs: string
+  body: string
+
+type ParsedSentryEvent = object
+  project: Project
+  projectIdStr: string
+  eventId: string
+  platform: string
+  level: string
+  errorType: string
+  message: string
+  displayMessage: string
+  stacktrace: string
+  receivedAt: int64
+  isLogEvent: bool
+
+var
+  sentryEnvelopeChannels: array[SentryEnvelopeWorkerCount, Channel[SentryEnvelopeJob]]
+  sentryEnvelopeWorkers: array[SentryEnvelopeWorkerCount, Thread[int]]
+  sentryEnvelopeWorkerStarted = false
+  sentryEnvelopeStartLock: Lock
+  sentryEnvelopeEnqueueLock: Lock
+  sentryEnvelopeNextWorker = 0
+  duplicateCacheLock: Lock
+  duplicateCache = initTable[string, int64]()
+  duplicateLastPrune = 0'i64
+
+initLock(sentryEnvelopeStartLock)
+initLock(sentryEnvelopeEnqueueLock)
+initLock(duplicateCacheLock)
+
+proc notifyProjectEmail(
+  project: Project,
+  title, body, eventType: string,
+  data: JsonNode,
+  priority: NotificationPriority = npNormal
+) =
+  let projectSettings = parseProjectNotificationSettings(project.notificationConfigs)
+  if not projectSettings.emailEnabled or projectSettings.emailToAddrs.strip().len == 0:
+    return
+  let service = buildProjectNotificationService(
+    "",
+    "",
+    project.notificationConfigs,
+    projectName = project.name
+  )
+  service.notify(NotificationMessage(
+    title: title,
+    body: body,
+    priority: priority,
+    eventType: eventType,
+    projectId: $project.id,
+    projectName: project.name,
+    data: data
+  ))
 
 proc parseSentryKeyFromAuth*(auth: string): string =
   const keyPrefix = "sentry_key="
@@ -128,6 +195,22 @@ proc nodeUnixTime(node: JsonNode, key: string): int64 =
       discard
   epochTime().int64
 
+proc nodeLogUnixTime(node: JsonNode): int64 =
+  if node.kind == JObject and "timestamp" in node:
+    return node.nodeUnixTime("timestamp")
+  if node.kind == JObject and "time_unix_nano" in node:
+    case node["time_unix_nano"].kind
+    of JInt:
+      return node["time_unix_nano"].getInt().int64 div 1_000_000_000'i64
+    of JString:
+      try:
+        return parseBiggestInt(node["time_unix_nano"].getStr()).int64 div 1_000_000_000'i64
+      except ValueError:
+        discard
+    else:
+      discard
+  epochTime().int64
+
 proc nodeTimestamp(node: JsonNode, key: string): int64 =
   if node.kind == JObject and key in node:
     case node[key].kind
@@ -156,37 +239,45 @@ proc newBreadcrumbLogEventId(eventId: string, index: int): string =
   else:
     ($uuid4()).replace("-", "")
 
-proc hasRecentDuplicate(
-  db: DbConn,
+proc duplicateKey(
+  projectId: int64,
+  platform, level, errorType, message: string
+): string =
+  $projectId & "\t" & platform & "\t" & level & "\t" & errorType & "\t" & message
+
+proc markRecentDuplicate(
   projectId: int64,
   platform, level, errorType, message: string,
   receivedAt: int64
 ): bool =
-  let row = db.getRow(
-    sql"""SELECT id FROM SentryEvent
-          WHERE project = ?
-          AND platform = ?
-          AND level = ?
-          AND errorType = ?
-          AND message = ?
-          AND receivedAt >= ?
-          LIMIT 1""",
-    projectId,
-    platform,
-    level,
-    errorType,
-    message,
-    receivedAt - DuplicateWindowSecs
-  )
-  row.isSome
+  let key = duplicateKey(projectId, platform, level, errorType, message)
+  result = false
+  withLock duplicateCacheLock:
+    if duplicateCache.len > DuplicateCacheMaxEntries or receivedAt - duplicateLastPrune >= DuplicateWindowSecs:
+      var expired: seq[string] = @[]
+      for cacheKey, lastSeen in duplicateCache:
+        if lastSeen < receivedAt - DuplicateWindowSecs:
+          expired.add cacheKey
+      for cacheKey in expired:
+        duplicateCache.del cacheKey
+      duplicateLastPrune = receivedAt
+
+    if key in duplicateCache and duplicateCache[key] >= receivedAt - DuplicateWindowSecs:
+      result = true
+    else:
+      duplicateCache[key] = receivedAt
 
 proc logDetails(logNode: JsonNode): string =
   var details = newJObject()
   if logNode.kind == JObject:
     if "trace_id" in logNode:
       details["trace_id"] = logNode["trace_id"]
+    if "span_id" in logNode:
+      details["span_id"] = logNode["span_id"]
     if "severity_number" in logNode:
       details["severity_number"] = logNode["severity_number"]
+    if "time_unix_nano" in logNode:
+      details["time_unix_nano"] = logNode["time_unix_nano"]
     if "attributes" in logNode:
       details["attributes"] = logNode["attributes"]
   if details.len == 0:
@@ -208,15 +299,49 @@ proc sentryWebhookData(
     "receivedAt": receivedAt
   }
 
+proc shouldNotifyLogWebhook(level: string): bool =
+  case level.toLowerAscii()
+  of "error", "fatal", "critical":
+    true
+  else:
+    false
+
+proc parseSentryLogRecord(
+  project: Project,
+  projectIdStr: string,
+  eventId: string,
+  logNode: JsonNode
+): Option[ParsedSentryEvent] =
+  let level = logNode.nodeString("level", logNode.nodeString("severity_text", "info")).toLowerAscii()
+  let message = logNode.nodeString("body", logNode.nodeString("message", ""))
+  let unixTime = logNode.nodeLogUnixTime()
+
+  if markRecentDuplicate(project.id, "log", level, "Log", message, unixTime):
+    return none[ParsedSentryEvent]()
+
+  some(ParsedSentryEvent(
+    project: project,
+    projectIdStr: projectIdStr,
+    eventId: eventId,
+    platform: "log",
+    level: level,
+    errorType: "Log",
+    message: message,
+    displayMessage: message,
+    stacktrace: logDetails(logNode),
+    receivedAt: unixTime,
+    isLogEvent: true
+  ))
+
 proc saveSentryLog*(
   project: Project,
   projectIdStr: string,
   eventId: string,
   logNode: JsonNode
 ) =
-  let level = logNode.nodeString("level", "info")
+  let level = logNode.nodeString("level", logNode.nodeString("severity_text", "info")).toLowerAscii()
   let message = logNode.nodeString("body", logNode.nodeString("message", ""))
-  let unixTime = logNode.nodeUnixTime("timestamp")
+  let unixTime = logNode.nodeLogUnixTime()
   var dbRecord = newSentryEvent(
     eventId = eventId,
     project = project,
@@ -229,7 +354,7 @@ proc saveSentryLog*(
   )
 
   withDb dbPool:
-    if hasRecentDuplicate(db, project.id, "log", level, "Log", message, unixTime):
+    if markRecentDuplicate(project.id, "log", level, "Log", message, unixTime):
       return
     db.insert(dbRecord)
 
@@ -239,12 +364,20 @@ proc saveSentryLog*(
     level = level,
     message = message
 
-  if project.webhookUrl.len > 0:
+  if shouldNotifyLogWebhook(level):
     let data = sentryWebhookData(eventId, level, "log", "Log", message, dbRecord.stacktrace, unixTime)
-    enqueueWebhook(
-      project.webhookUrl,
+    if project.webhookUrl.len > 0:
+      enqueueWebhook(
+        project.webhookUrl,
+        "log.created",
+        webhookPayload("log.created", $project.id, project.name, data)
+      )
+    notifyProjectEmail(
+      project,
+      project.name & ": Log",
+      "[" & level & "] " & message,
       "log.created",
-      webhookPayload("log.created", $project.id, project.name, data)
+      data
     )
 
 proc saveSentryLogs*(
@@ -263,6 +396,27 @@ proc saveSentryLogs*(
     if result.len == 0:
       result = eventId
     saveSentryLog(project, projectIdStr, eventId, item)
+    inc index
+
+proc parseSentryLogRecords(
+  project: Project,
+  projectIdStr: string,
+  envelopeEventId: string,
+  payload: string,
+  records: var seq[ParsedSentryEvent]
+): string =
+  let data = parseJson(payload)
+  if data.kind != JObject or "items" notin data or data["items"].kind != JArray:
+    raise newException(ValueError, "Invalid Sentry log payload")
+
+  var index = 0
+  for item in data["items"]:
+    let eventId = newLogEventId(envelopeEventId, index)
+    if result.len == 0:
+      result = eventId
+    let record = parseSentryLogRecord(project, projectIdStr, eventId, item)
+    if record.isSome:
+      records.add record.get
     inc index
 
 proc saveSentryBreadcrumbLog*(
@@ -299,7 +453,7 @@ proc saveSentryBreadcrumbLog*(
   )
 
   withDb dbPool:
-    if hasRecentDuplicate(db, project.id, "log", level, "Log", message, unixTime):
+    if markRecentDuplicate(project.id, "log", level, "Log", message, unixTime):
       return
     db.insert(dbRecord)
 
@@ -310,12 +464,20 @@ proc saveSentryBreadcrumbLog*(
     category = breadcrumb.category,
     message = message
 
-  if project.webhookUrl.len > 0:
+  if shouldNotifyLogWebhook(level):
     let data = sentryWebhookData(eventId, level, "log", "Log", message, "", unixTime)
-    enqueueWebhook(
-      project.webhookUrl,
+    if project.webhookUrl.len > 0:
+      enqueueWebhook(
+        project.webhookUrl,
+        "log.created",
+        webhookPayload("log.created", $project.id, project.name, data)
+      )
+    notifyProjectEmail(
+      project,
+      project.name & ": Log",
+      "[" & level & "] " & message,
       "log.created",
-      webhookPayload("log.created", $project.id, project.name, data)
+      data
     )
 
 proc saveSentryBreadcrumbLogs*(
@@ -365,7 +527,7 @@ proc saveSentryBreadcrumbJsonLog*(
   )
 
   withDb dbPool:
-    if hasRecentDuplicate(db, project.id, "log", level, "Log", message, unixTime):
+    if markRecentDuplicate(project.id, "log", level, "Log", message, unixTime):
       return
     db.insert(dbRecord)
 
@@ -375,7 +537,7 @@ proc saveSentryBreadcrumbJsonLog*(
     level = level,
     message = message
 
-  if project.webhookUrl.len > 0:
+  if project.webhookUrl.len > 0 and shouldNotifyLogWebhook(level):
     let data = sentryWebhookData(eventId, level, "log", "Log", message, dbRecord.stacktrace, unixTime)
     enqueueWebhook(
       project.webhookUrl,
@@ -468,6 +630,149 @@ proc extractEventJsonMessage(eventNode: JsonNode): (string, string, string, stri
     return ("Message", message, message, "")
   ("Unknown", "Unknown error message format", "Unknown error message format", "")
 
+proc hasEventJsonException(eventNode: JsonNode): bool =
+  if eventNode.kind != JObject or "exception" notin eventNode:
+    return false
+  let exceptionBlock = eventNode["exception"]
+  exceptionBlock.kind == JObject and "values" in exceptionBlock and
+    exceptionBlock["values"].kind == JArray and exceptionBlock["values"].len > 0
+
+proc extractEventJsonLogMessage(eventNode: JsonNode): string =
+  if eventNode.kind != JObject or "logentry" notin eventNode:
+    return ""
+
+  let logEntry = eventNode["logentry"]
+  if logEntry.kind == JString:
+    return logEntry.getStr()
+  if logEntry.kind == JObject:
+    result = logEntry.nodeString("formatted")
+    if result.len == 0:
+      result = logEntry.nodeString("message")
+
+proc parseSentryEventJsonRecord(
+  project: Project,
+  projectIdStr: string,
+  eventId: string,
+  payload: string
+): Option[ParsedSentryEvent] =
+  let eventNode = parseJson(payload)
+  let isLogEvent = not hasEventJsonException(eventNode) and extractEventJsonLogMessage(eventNode).len > 0
+  let (errorType, message, displayMessage, stacktrace) =
+    if isLogEvent:
+      let logMessage = extractEventJsonLogMessage(eventNode)
+      ("Log", logMessage, logMessage, logDetails(eventNode))
+    else:
+      extractEventJsonMessage(eventNode)
+  let level = eventNode.nodeString("level", "info").toLowerAscii()
+  let platform =
+    if isLogEvent:
+      "log"
+    else:
+      eventNode.nodeString("platform")
+  let unixNow = epochTime().int64
+
+  saveSentryBreadcrumbJsonLogs(project, projectIdStr, eventId, payload)
+
+  if markRecentDuplicate(project.id, platform, level, errorType, message, unixNow):
+    return none[ParsedSentryEvent]()
+
+  some(ParsedSentryEvent(
+    project: project,
+    projectIdStr: projectIdStr,
+    eventId: eventId,
+    platform: platform,
+    level: level,
+    errorType: errorType,
+    message: message,
+    displayMessage: displayMessage,
+    stacktrace: stacktrace,
+    receivedAt: unixNow,
+    isLogEvent: isLogEvent
+  ))
+
+proc insertParsedSentryEvents(records: openArray[ParsedSentryEvent]) =
+  if records.len == 0:
+    return
+
+  withDb dbPool:
+    db.exec(dbSql"BEGIN")
+    try:
+      for record in records:
+        var dbRecord = newSentryEvent(
+          eventId = record.eventId,
+          project = record.project,
+          platform = record.platform,
+          level = record.level,
+          errorType = record.errorType,
+          message = record.message,
+          stacktrace = record.stacktrace,
+          receivedAt = record.receivedAt
+        )
+        db.insert(dbRecord)
+      db.exec(dbSql"COMMIT")
+    except CatchableError:
+      db.exec(dbSql"ROLLBACK")
+      raise
+
+proc notifyParsedSentryEvent(record: ParsedSentryEvent) =
+  if record.isLogEvent:
+    info "Sentry log event received",
+      project = record.projectIdStr,
+      eventId = record.eventId,
+      level = record.level,
+      message = record.displayMessage
+
+    if shouldNotifyLogWebhook(record.level):
+      let data = sentryWebhookData(
+        record.eventId, record.level, "log", "Log",
+        record.message, record.stacktrace, record.receivedAt
+      )
+      if record.project.webhookUrl.len > 0:
+        enqueueWebhook(
+          record.project.webhookUrl,
+          "log.created",
+          webhookPayload("log.created", $record.project.id, record.project.name, data)
+        )
+      notifyProjectEmail(
+        record.project,
+        record.project.name & ": Log",
+        "[" & record.level & "] " & record.displayMessage,
+        "log.created",
+        data
+      )
+    return
+
+  info "Sentry event received",
+    project = record.projectIdStr,
+    eventId = record.eventId,
+    level = record.level,
+    platform = record.platform,
+    message = record.displayMessage
+
+  if record.project.ntfyTopic.len > 0:
+    let alertTitle = record.project.name & ": " & record.errorType
+    let notificationBody = "[" & record.level & "] " & record.displayMessage
+    enqueueNtfy(record.project.ntfyTopic, notificationBody, alertTitle)
+
+  let data = sentryWebhookData(
+    record.eventId, record.level, record.platform, record.errorType,
+    record.message, record.stacktrace, record.receivedAt
+  )
+  if record.project.webhookUrl.len > 0:
+    enqueueWebhook(
+      record.project.webhookUrl,
+      "issue.created",
+      webhookPayload("issue.created", $record.project.id, record.project.name, data)
+    )
+  notifyProjectEmail(
+    record.project,
+    record.project.name & ": " & record.errorType,
+    "[" & record.level & "] " & record.displayMessage,
+    "issue.created",
+    data,
+    npHigh
+  )
+
 proc saveSentryEventJson*(
   project: Project,
   projectIdStr: string,
@@ -475,9 +780,19 @@ proc saveSentryEventJson*(
   payload: string
 ) =
   let eventNode = parseJson(payload)
-  let (errorType, message, displayMessage, stacktrace) = extractEventJsonMessage(eventNode)
-  let level = eventNode.nodeString("level")
-  let platform = eventNode.nodeString("platform")
+  let isLogEvent = not hasEventJsonException(eventNode) and extractEventJsonLogMessage(eventNode).len > 0
+  let (errorType, message, displayMessage, stacktrace) =
+    if isLogEvent:
+      let logMessage = extractEventJsonLogMessage(eventNode)
+      ("Log", logMessage, logMessage, logDetails(eventNode))
+    else:
+      extractEventJsonMessage(eventNode)
+  let level = eventNode.nodeString("level", "info").toLowerAscii()
+  let platform =
+    if isLogEvent:
+      "log"
+    else:
+      eventNode.nodeString("platform")
   let unixNow = epochTime().int64
   var dbRecord = newSentryEvent(
     eventId = eventId,
@@ -492,7 +807,7 @@ proc saveSentryEventJson*(
 
   var inserted = false
   withDb dbPool:
-    if not hasRecentDuplicate(db, project.id, platform, level, errorType, message, unixNow):
+    if not markRecentDuplicate(project.id, platform, level, errorType, message, unixNow):
       db.insert(dbRecord)
       inserted = true
 
@@ -507,6 +822,30 @@ proc saveSentryEventJson*(
       message = displayMessage
     return
 
+  if isLogEvent:
+    info "Sentry log event received",
+      project = projectIdStr,
+      eventId = eventId,
+      level = level,
+      message = displayMessage
+
+    if shouldNotifyLogWebhook(level):
+      let data = sentryWebhookData(eventId, level, "log", "Log", message, stacktrace, unixNow)
+      if project.webhookUrl.len > 0:
+        enqueueWebhook(
+          project.webhookUrl,
+          "log.created",
+          webhookPayload("log.created", $project.id, project.name, data)
+        )
+      notifyProjectEmail(
+        project,
+        project.name & ": Log",
+        "[" & level & "] " & displayMessage,
+        "log.created",
+        data
+      )
+    return
+
   info "Sentry event received",
     project = projectIdStr,
     eventId = eventId,
@@ -519,13 +858,21 @@ proc saveSentryEventJson*(
     let notificationBody = "[" & level & "] " & displayMessage
     enqueueNtfy(project.ntfyTopic, notificationBody, alertTitle)
 
+  let data = sentryWebhookData(eventId, level, platform, errorType, message, stacktrace, unixNow)
   if project.webhookUrl.len > 0:
-    let data = sentryWebhookData(eventId, level, platform, errorType, message, stacktrace, unixNow)
     enqueueWebhook(
       project.webhookUrl,
       "issue.created",
       webhookPayload("issue.created", $project.id, project.name, data)
     )
+  notifyProjectEmail(
+    project,
+    project.name & ": " & errorType,
+    "[" & level & "] " & displayMessage,
+    "issue.created",
+    data,
+    npHigh
+  )
 
 proc saveSentryEvent*(
   project: Project,
@@ -561,13 +908,21 @@ proc saveSentryEvent*(
     let notificationBody = "[" & eventData.level & "] " & displayMessage
     enqueueNtfy(project.ntfyTopic, notificationBody, alertTitle)
 
+  let data = sentryWebhookData(eventId, eventData.level, eventData.platform, errorType, message, stacktrace, unixNow)
   if project.webhookUrl.len > 0:
-    let data = sentryWebhookData(eventId, eventData.level, eventData.platform, errorType, message, stacktrace, unixNow)
     enqueueWebhook(
       project.webhookUrl,
       "issue.created",
       webhookPayload("issue.created", $project.id, project.name, data)
     )
+  notifyProjectEmail(
+    project,
+    project.name & ": " & errorType,
+    "[" & eventData.level & "] " & displayMessage,
+    "issue.created",
+    data,
+    npHigh
+  )
 
 proc processEnvelopeBody*(project: Project, projectIdStr: string, body: string): string =
   var pos = 0
@@ -602,3 +957,138 @@ proc processEnvelopeBody*(project: Project, projectIdStr: string, body: string):
     firstStoredId
   else:
     envHeader.event_id
+
+proc parseEnvelopeEventRecords(
+  project: Project,
+  projectIdStr: string,
+  body: string,
+  records: var seq[ParsedSentryEvent]
+): string =
+  var pos = 0
+  var firstStoredId = ""
+
+  let envHeaderLine = body.readNextLine(pos)
+  if envHeaderLine.len == 0:
+    raise newException(ValueError, "Missing envelope header")
+
+  let envHeader = envHeaderLine.fromJson(EnvelopeHeader)
+
+  while pos < body.len:
+    let itemHeaderLine = body.readNextLine(pos).strip()
+    if itemHeaderLine.len == 0:
+      continue
+
+    let itemHeader = itemHeaderLine.fromJson(ItemHeader)
+    let payloadSlice = maybeUncompress(body.readItemPayload(pos, itemHeader))
+
+    if itemHeader.`type` == "event":
+      let record = parseSentryEventJsonRecord(
+        project, projectIdStr, envHeader.event_id, payloadSlice
+      )
+      if record.isSome:
+        records.add record.get
+      if firstStoredId.len == 0:
+        firstStoredId = envHeader.event_id
+    elif itemHeader.`type` == "transaction":
+      discard
+    elif itemHeader.`type` == "log":
+      let logId = parseSentryLogRecords(
+        project, projectIdStr, envHeader.event_id, payloadSlice, records
+      )
+      if firstStoredId.len == 0:
+        firstStoredId = logId
+
+  if firstStoredId.len > 0:
+    firstStoredId
+  else:
+    envHeader.event_id
+
+proc queuedEnvelopeResponseId*(body: string): string =
+  var pos = 0
+  let envHeaderLine = body.readNextLine(pos)
+  if envHeaderLine.len == 0:
+    raise newException(ValueError, "Missing envelope header")
+
+  let envHeader = envHeaderLine.fromJson(EnvelopeHeader)
+  result = envHeader.event_id
+
+  while pos < body.len:
+    let itemHeaderLine = body.readNextLine(pos).strip()
+    if itemHeaderLine.len == 0:
+      continue
+
+    let itemHeader = itemHeaderLine.fromJson(ItemHeader)
+    discard body.readItemPayload(pos, itemHeader)
+    if itemHeader.`type` == "event":
+      return envHeader.event_id
+    if itemHeader.`type` == "log":
+      return newLogEventId(envHeader.event_id, 0)
+
+proc sentryEnvelopeWorkerLoop(workerId: int) {.thread.} =
+  while true:
+    var jobs = @[sentryEnvelopeChannels[workerId].recv()]
+    while jobs.len < SentryEnvelopeBatchSize:
+      let received = sentryEnvelopeChannels[workerId].tryRecv()
+      if not received.dataAvailable:
+        break
+      jobs.add received.msg
+
+    var records: seq[ParsedSentryEvent] = @[]
+    try:
+      {.cast(gcsafe).}:
+        for job in jobs:
+          let project = Project(
+            name: job.projectName,
+            publicKey: "",
+            ntfyTopic: job.ntfyTopic,
+            webhookUrl: job.webhookUrl,
+            notificationConfigs: job.notificationConfigs,
+            owner: User()
+          )
+          project.id = job.projectDbId
+          discard parseEnvelopeEventRecords(project, job.projectIdStr, job.body, records)
+
+        insertParsedSentryEvents(records)
+        for record in records:
+          notifyParsedSentryEvent(record)
+    except CatchableError as e:
+      error "Failed to save queued Sentry envelope",
+        batchSize = jobs.len, errorMsg = e.msg
+
+proc startSentryIngestionWorker*() =
+  withLock sentryEnvelopeStartLock:
+    if sentryEnvelopeWorkerStarted:
+      return
+    let workerQueueSize = max(1, SentryEnvelopeQueueSize div SentryEnvelopeWorkerCount)
+    for i in 0 ..< SentryEnvelopeWorkerCount:
+      sentryEnvelopeChannels[i].open(workerQueueSize)
+      createThread(sentryEnvelopeWorkers[i], sentryEnvelopeWorkerLoop, i)
+    sentryEnvelopeWorkerStarted = true
+    info "Sentry ingestion workers started", count = SentryEnvelopeWorkerCount
+
+proc tryEnqueueSentryEnvelope*(
+  project: Project,
+  projectIdStr: string,
+  body: string
+): bool =
+  if not sentryEnvelopeWorkerStarted:
+    startSentryIngestionWorker()
+
+  let job = SentryEnvelopeJob(
+    projectDbId: project.id.int,
+    projectIdStr: projectIdStr,
+    projectName: project.name,
+    ntfyTopic: project.ntfyTopic,
+    webhookUrl: project.webhookUrl,
+    notificationConfigs: project.notificationConfigs,
+    body: body
+  )
+
+  withLock sentryEnvelopeEnqueueLock:
+    let start = sentryEnvelopeNextWorker
+    for offset in 0 ..< SentryEnvelopeWorkerCount:
+      let workerId = (start + offset) mod SentryEnvelopeWorkerCount
+      if sentryEnvelopeChannels[workerId].trySend(job):
+        sentryEnvelopeNextWorker = (workerId + 1) mod SentryEnvelopeWorkerCount
+        return true
+    result = false

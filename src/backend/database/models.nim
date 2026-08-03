@@ -1,23 +1,24 @@
-import norm/model
+import norm/[model, pragmas]
 
 type
-  User* = ref object of Model
+  User* {.tableName: "users".} = ref object of Model
     name*: string
     email*: string
     passwordHash*: string
 
-  Project* = ref object of Model
+  Project* {.tableName: "projects".} = ref object of Model
     name*: string
     publicKey*: string
     ntfyTopic*: string
     webhookUrl*: string
+    notificationConfigs*: string
     owner*: User
 
-  UserProjectAccess* = ref object of Model
-    user*: User
+  UserProjectAccess* {.tableName: "user_project_access".} = ref object of Model
+    memberUser*: User
     project*: Project
 
-  SentryEvent* = ref object of Model
+  SentryEvent* {.tableName: "sentry_events".} = ref object of Model
     eventId*: string
     project*: Project
     platform*: string
@@ -27,7 +28,7 @@ type
     stacktrace*: string
     receivedAt*: int64
 
-  ProjectMetric* = ref object of Model
+  ProjectMetric* {.tableName: "project_metrics".} = ref object of Model
     project*: Project
     name*: string
     metricType*: string
@@ -39,11 +40,23 @@ type
 proc newUser*(name, email, passwordHash: string): User =
   User(name: name, email: email, passwordHash: passwordHash)
 
-proc newProject*(name, publicKey, ntfyTopic: string, owner: User, webhookUrl: string = ""): Project =
-  Project(name: name, publicKey: publicKey, ntfyTopic: ntfyTopic, webhookUrl: webhookUrl, owner: owner)
+proc newProject*(
+  name, publicKey, ntfyTopic: string,
+  owner: User,
+  webhookUrl: string = "",
+  notificationConfigs: string = "[]"
+): Project =
+  Project(
+    name: name,
+    publicKey: publicKey,
+    ntfyTopic: ntfyTopic,
+    webhookUrl: webhookUrl,
+    notificationConfigs: notificationConfigs,
+    owner: owner
+  )
 
 proc newUserProjectAccess*(user: User, project: Project): UserProjectAccess =
-  UserProjectAccess(user: user, project: project)
+  UserProjectAccess(memberUser: user, project: project)
 
 proc newSentryEvent*(eventId: string, project: Project, platform, level, errorType, message, stacktrace: string, receivedAt: int64): SentryEvent =
   SentryEvent(

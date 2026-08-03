@@ -64,7 +64,7 @@ proc renderProjectTabs(projectId, projectName: string, active: string): VNode =
     tdiv(class="mb-6 flex flex-wrap items-start justify-between gap-3"):
       tdiv(class="min-w-0 flex-1"):
         a(class="text-sm text-pink-700 hover:underline", href="#/dashboard"):
-          text "← Back to projects"
+          text "Back to projects"
         h2(class="mt-2 text-2xl font-semibold"):
           text projectName
     tdiv(class="mb-5 border-b border-slate-200"):

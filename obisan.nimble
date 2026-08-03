@@ -1,4 +1,5 @@
 # Package
+import os, strutils
 
 version       = "0.1.0"
 author        = "Siddhartha Khanal"
@@ -18,7 +19,8 @@ requires "mummy >= 0.4.7"
 requires "zippy >= 0.10.9"
 requires "uuid4"
 requires "quickjwt >= 0.2.1"
-requires "https://github.com/buffmomoeveryday/quee.git"
+requires "https://github.com/buffmomoeveryday/quee.git >= 0.0.1"
+requires "malebolgia >= 1.3.2"
 
 # frontend
 requires "karax >= 0.10.0"
@@ -27,8 +29,8 @@ requires "https://github.com/nitely/nim-kxrouter.git"
 
 task build_backend, "Builds the backend production binary":
   mkDir("bin")
-  exec "nim c -d:release -d:ssl --threads:on --outdir:bin src/backend/obisan.nim"
-
+  exec "sed -i 's/listenBacklogLen = 128/listenBacklogLen = 4096/' $(nimble path mummy 2>/dev/null | head -1)/mummy.nim"
+  exec "nim c --mm:arc -d:release -d:ssl --threads:on --nimcache:bin/nimcache-sqlite --out:bin/obisan src/backend/obisan.nim"
 
 task build_frontend, "Builds the frontend production binary":
   mkDir("bin")
@@ -38,3 +40,5 @@ task build_frontend, "Builds the frontend production binary":
 task prod, "Builds everything":
   exec "nimble build_frontend"
   exec "nimble build_backend"
+
+requires "smtp >= 0.1.0"

@@ -1,6 +1,5 @@
 include karax/prelude
 
-import strutils
 import ../utils/auth
 
 proc renderAppHeader*(title: string, subtitle: string = ""): VNode =
@@ -18,6 +17,10 @@ proc renderAppHeader*(title: string, subtitle: string = ""): VNode =
         tdiv(class="hidden sm:flex items-center gap-4 text-sm"):
           a(class="font-medium text-slate-950 hover:text-pink-700", href="#/dashboard"):
             text "Projects"
+          a(class="font-medium text-slate-950 hover:text-pink-700", href="#/invite"):
+            text "Invite"
+          a(class="font-medium text-slate-950 hover:text-pink-700", href="#/settings"):
+            text "Settings"
       tdiv(class="flex items-center gap-3"):
         if currentUser.email.len > 0:
           p(class="hidden sm:block text-sm text-slate-500"):
@@ -33,17 +36,6 @@ proc renderAppHeader*(title: string, subtitle: string = ""): VNode =
           text "Sign out"
           proc onclick(ev: Event; n: VNode) =
             logout()
-
-proc levelBadgeClass(level: string): string =
-  case level.toLowerAscii()
-  of "error", "fatal":
-    "bg-red-100 text-red-800"
-  of "warning":
-    "bg-amber-100 text-amber-800"
-  of "info":
-    "bg-blue-100 text-blue-800"
-  else:
-    "bg-slate-100 text-slate-700"
 
 proc renderCopyFeedback*(): VNode =
   if copyFeedback.len == 0:

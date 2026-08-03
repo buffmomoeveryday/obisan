@@ -6,35 +6,95 @@ import json
 import ../service/metricsService
 import ../service/uptimeService
 import ../service/uptimeStore
-import ../utils/ntfy
-import ../utils/webhook
+import ../service/notification/notificationService
 
-task sendNtfyNotification(topic: string, message: string, title: string):
-  queue "notifications"
-  postToNtfy(topic, message, title, "high")
+type MetricsIngestJob = object
+  projectDbId: int
+  payload: string
 
-task sendWebhookNotification(url: string, eventType: string, payload: string):
-  queue "notifications"
-  postToWebhook(url, eventType, parseJson(payload))
+var
+  metricsIngestChannel: Channel[MetricsIngestJob]
+  metricsIngestWorker: Thread[void]
+  metricsIngestWorkerStarted = false
 
-task writeProjectMetrics(projectDbId: int, payload: string):
-  queue "metrics"
-  discard saveMetricsPayload(projectDbId, payload)
+proc metricsIngestWorkerLoop() {.thread.} =
+  while true:
+    let job = metricsIngestChannel.recv()
+    try:
+      let metrics = parseQueuedMetricsPayload(job.payload)
+      var saved = 0
+      {.cast(gcsafe).}:
+        saved = saveMetricsBatch(job.projectDbId, metrics)
+      info "Saved project metrics", projectDbId = job.projectDbId, count = saved
+    except CatchableError as e:
+      error "Failed to save queued project metrics",
+        projectDbId = job.projectDbId, errorMsg = e.msg
+
+proc startMetricsIngestionWorker*() =
+  if metricsIngestWorkerStarted:
+    return
+  metricsIngestChannel.open(4096)
+  createThread(metricsIngestWorker, metricsIngestWorkerLoop)
+  metricsIngestWorkerStarted = true
+  info "Metrics ingestion worker started"
+
+# ---------------------------------------------------------------------------
+# Task definitions
+# ---------------------------------------------------------------------------
 
 task checkUptimeMonitor(monitorId: string):
   queue "uptime"
   executeMonitorCheck(monitorId)
 
-proc enqueueNtfy*(topic, message, title: string) =
-  discard sendNtfyNotification.enqueue(topic, message, title).run()
+# ---------------------------------------------------------------------------
+# Synchronous notification helpers (no quee)
+# ---------------------------------------------------------------------------
+proc sendNtfyNow*(topic, message, title: string) =
+  if topic.len == 0:
+    return
+  let service = buildProjectNotificationService(topic, "")
+  service.notify(NotificationMessage(
+    title: title,
+    body: message,
+    priority: npHigh,
+    eventType: "",
+    projectId: "",
+    projectName: "",
+    data: newJNull()
+  ))
 
-proc enqueueWebhook*(url, eventType: string, payload: JsonNode) =
+proc sendWebhookNow*(url, eventType: string, payload: JsonNode) =
   if url.len == 0:
     return
-  discard sendWebhookNotification.enqueue(url, eventType, payload.pretty).run()
+  let service = buildProjectNotificationService("", url)
+  service.notify(NotificationMessage(
+    title: eventType,
+    body: payload.pretty,
+    priority: npNormal,
+    eventType: eventType,
+    projectId: "",
+    projectName: "",
+    data: payload
+  ))
+
+proc enqueueNtfy*(topic, message, title: string) =
+  sendNtfyNow(topic, message, title)
+
+proc enqueueWebhook*(url, eventType: string, payload: JsonNode) =
+  sendWebhookNow(url, eventType, payload)
+
+# ---------------------------------------------------------------------------
+# Metrics — channel-backed worker, avoiding inline request-path writes and LMDB.
+# ---------------------------------------------------------------------------
 
 proc enqueueProjectMetrics*(projectDbId: int, payload: string) =
-  discard writeProjectMetrics.enqueue(projectDbId, payload).run()
+  if not metricsIngestWorkerStarted:
+    startMetricsIngestionWorker()
+  metricsIngestChannel.send(MetricsIngestJob(projectDbId: projectDbId, payload: payload))
+
+# ---------------------------------------------------------------------------
+# Uptime — stays on the LMDB queue (low throughput)
+# ---------------------------------------------------------------------------
 
 proc enqueueUptimeMonitor*(monitorId: string, intervalSecs: int) =
   discard checkUptimeMonitor.enqueue(monitorId).every(intervalSecs.seconds).run()

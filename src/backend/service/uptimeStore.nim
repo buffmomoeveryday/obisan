@@ -13,16 +13,22 @@ const
   UptimeTaskName* = "checkUptimeMonitor"
 
 var uptimeStorePath* = ""
+var cachedUptimeDb: Database[string, string]
+var cachedUptimeDbReady = false
 
 proc initUptimeStore*(basePath: string) =
   uptimeStorePath = basePath / "uptime-store"
   createDir(uptimeStorePath)
-  discard openQueueDb(uptimeStorePath)
+  cachedUptimeDb = openQueueDb(uptimeStorePath)
+  cachedUptimeDbReady = true
 
 proc storeDb(): Database[string, string] =
   if uptimeStorePath.len == 0:
     raise newException(ValueError, "Uptime store not initialized")
-  openQueueDb(uptimeStorePath)
+  if not cachedUptimeDbReady:
+    cachedUptimeDb = openQueueDb(uptimeStorePath)
+    cachedUptimeDbReady = true
+  cachedUptimeDb
 
 proc monitorKey(monitorId: string): string =
   MonitorKeyPrefix & monitorId
